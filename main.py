@@ -448,10 +448,10 @@ def build_erp_context(question: str, group_source_id: str | None = None,
     for p in products[:5]:
         price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
         plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability', '')}")
-    erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答，不要捏造價格：\n" + "\n".join(plines)
+    erp_context = "\n\n以下是 ERP 系統中的商品資料（價格單位為新台幣 NTD），請嚴格根據這些資料回答，絕對不要捏造價格：\n" + "\n".join(plines)
 
     if not allow_customer_pricing:
-        erp_context += "\n注意：此用戶沒有客戶專屬定價權限，只提供建議售價。"
+        erp_context += "\n注意：此用戶沒有客戶專屬定價權限，只提供建議售價。不要透露任何折扣資訊。"
         return erp_context
 
     # Determine customer code: explicit in question > group alias
@@ -468,11 +468,23 @@ def build_erp_context(question: str, group_source_id: str | None = None,
     if customer_code and products:
         customer_info = erp_get_customer(customer_code)
         if customer_info:
-            erp_context += f"\n客戶 {customer_code} 資訊：{json.dumps(customer_info, ensure_ascii=False)}"
+            erp_context += f"\n\n客戶資訊：代號 {customer_code}，名稱 {customer_info.get('name', '')}，等級 {customer_info.get('tier', '')}"
         for p in products[:3]:
             quote = erp_query("quote", code=customer_code, sku=p["sku"])
             if quote and isinstance(quote, dict) and "error" not in quote:
-                erp_context += f"\n客戶 {customer_code} 的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
+                pr = quote.get("pricing", {})
+                erp_context += (
+                    f"\n{p['sku']} 客戶報價：建議售價 NT${pr.get('msrp', 0):,}，"
+                    f"客戶價 NT${pr.get('unitPrice', 0):,}，"
+                    f"折扣 {pr.get('discount', 0)}%，"
+                    f"價格來源：{pr.get('source', 'msrp')}，"
+                    f"庫存：{quote.get('availability', '洽詢')}"
+                )
+
+        erp_context += (
+            "\n\n回覆格式範例：「U7-Pro 您的專屬價 NT$6,934（建議售價 NT$7,299，折扣 5%）・約四個工作天可交貨」"
+            "\n價格來源說明：customer_specific=客戶專屬價、tier=等級定價、brand=品牌折扣、msrp=無特價"
+        )
 
     return erp_context
 
