@@ -418,6 +418,57 @@ def parse_product_query(question: str) -> dict:
     return {"customer_code": None, "product_keyword": question}
 
 
+PRICE_KEYWORDS = re.compile(
+    r"(查|報價|價錢|多少錢|價格|定價|售價|查價|幾塊|怎麼賣|U\d|UDR|UDM|UDW|USW|UCG|UXG|UAP)",
+    re.IGNORECASE,
+)
+
+
+def is_product_query(text: str) -> bool:
+    """Detect if a message is asking about products/pricing."""
+    return bool(PRICE_KEYWORDS.search(text))
+
+
+def build_erp_context(question: str, group_source_id: str | None = None) -> str:
+    """Query ERP and build context string for LLM."""
+    parsed = parse_product_query(question)
+    customer_code = parsed.get("customer_code")
+    keyword = parsed.get("product_keyword") or question
+
+    erp_context = ""
+    products = erp_query("products", search=keyword)
+    if not products or not isinstance(products, list) or len(products) == 0:
+        return ""
+
+    plines = []
+    for p in products[:5]:
+        price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
+        plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability', '')}")
+    erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答，不要捏造價格：\n" + "\n".join(plines)
+
+    # Determine customer code: explicit in question > group alias
+    if not customer_code and group_source_id and SessionLocal:
+        db = SessionLocal()
+        try:
+            alias_obj = db.query(GroupAlias).filter_by(group_id=group_source_id).first()
+            if alias_obj:
+                customer_code = alias_obj.alias
+        finally:
+            db.close()
+
+    # Get customer-specific quotes
+    if customer_code and products:
+        customer_info = erp_get_customer(customer_code)
+        if customer_info:
+            erp_context += f"\n客戶 {customer_code} 資訊：{json.dumps(customer_info, ensure_ascii=False)}"
+        for p in products[:3]:
+            quote = erp_query("quote", code=customer_code, sku=p["sku"])
+            if quote and isinstance(quote, dict) and "error" not in quote:
+                erp_context += f"\n客戶 {customer_code} 的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
+
+    return erp_context
+
+
 def erp_search_products(keyword: str) -> str:
     results = erp_query("products", search=keyword)
     if not results or isinstance(results, dict) and "error" in results:
@@ -817,7 +868,18 @@ async def callback(request: Request) -> dict:
             # --- 1:1 chat: conversation + commitment extraction ---
             if source_type == "user":
                 try:
-                    assistant_reply = chat_with_llm(user_id, user_text)
+                    erp_context = ""
+                    if is_product_query(user_text):
+                        erp_context = build_erp_context(user_text)
+                    system_msg = SYSTEM_PROMPT + erp_context
+                    history = conversation_history[user_id]
+                    history.append({"role": "user", "content": user_text})
+                    if len(history) > MAX_HISTORY:
+                        conversation_history[user_id] = history[-MAX_HISTORY:]
+                        history = conversation_history[user_id]
+                    msgs = [{"role": "system", "content": system_msg}] + history
+                    assistant_reply = call_llm(msgs)
+                    history.append({"role": "assistant", "content": assistant_reply})
                 except Exception as e:
                     logger.error(f"LLM chat error: {e}")
                     assistant_reply = "系統暫時無法回應，請稍後再試。"
@@ -850,42 +912,7 @@ async def callback(request: Request) -> dict:
                     question = user_text[len(HELPER_TRIGGER):].strip()
                     if question:
                         try:
-                            # Parse question to extract customer code + product keyword
-                            parsed = parse_product_query(question)
-                            customer_code = parsed.get("customer_code")
-                            keyword = parsed.get("product_keyword") or question
-
-                            erp_context = ""
-                            products = erp_query("products", search=keyword)
-                            if products and isinstance(products, list) and len(products) > 0:
-                                plines = []
-                                for p in products[:5]:
-                                    price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
-                                    plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability','')}")
-                                erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答：\n" + "\n".join(plines)
-
-                            # Determine customer code: explicit > group alias
-                            if not customer_code:
-                                alias_obj = None
-                                if SessionLocal:
-                                    db = SessionLocal()
-                                    try:
-                                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
-                                    finally:
-                                        db.close()
-                                if alias_obj:
-                                    customer_code = alias_obj.alias
-
-                            # Get customer-specific quotes
-                            if customer_code and products and isinstance(products, list):
-                                customer_info = erp_get_customer(customer_code)
-                                if customer_info:
-                                    erp_context += f"\n客戶 {customer_code} 資訊：{json.dumps(customer_info, ensure_ascii=False)}"
-                                for p in products[:3]:
-                                    quote = erp_query("quote", code=customer_code, sku=p["sku"])
-                                    if quote and isinstance(quote, dict) and "error" not in quote:
-                                        erp_context += f"\n客戶 {customer_code} 的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
-
+                            erp_context = build_erp_context(question, source_id)
                             system_msg = SYSTEM_PROMPT + erp_context
                             history = conversation_history.get(f"group_{source_id}", [])
                             history.append({"role": "user", "content": question})
