@@ -41,6 +41,8 @@ SYSTEM_PROMPT = (
     "請用親切、專業的語氣回答使用者的問題。"
     "如果遇到無法回答的問題，請引導使用者聯繫真人客服。"
     "請一律使用繁體中文回覆。"
+    "【重要】絕對不要捏造或猜測商品價格。"
+    "如果沒有收到 ERP 系統的價格資料，請回覆「查無此商品」或建議用戶提供正確型號。"
 )
 
 QUERY_PARSE_PROMPT = """你是一個查詢解析助理。請從使用者的問題中提取：
@@ -440,9 +442,9 @@ def build_erp_context(question: str, group_source_id: str | None = None,
     keyword = parsed.get("product_keyword") or question
 
     erp_context = ""
-    products = erp_query("products", search=keyword)
-    if not products or not isinstance(products, list) or len(products) == 0:
-        return ""
+    products = erp_search_with_fallback(keyword)
+    if not products:
+        return "\n\n[ERP 系統查無「" + keyword + "」相關商品。請告知用戶查無此商品，不要自行編造價格。]"
 
     plines = []
     for p in products[:5]:
@@ -489,11 +491,31 @@ def build_erp_context(question: str, group_source_id: str | None = None,
     return erp_context
 
 
-def erp_search_products(keyword: str) -> str:
+def erp_search_with_fallback(keyword: str) -> list | None:
+    """Search ERP with fallback: try original, then with hyphen, then without."""
     results = erp_query("products", search=keyword)
-    if not results or isinstance(results, dict) and "error" in results:
+    if results and isinstance(results, list) and len(results) > 0:
+        return results
+    # Try adding hyphen: U7PRO → U7-PRO
+    normalized = re.sub(r"([A-Za-z])(\d)", r"\1-\2", keyword)
+    if normalized != keyword:
+        results = erp_query("products", search=normalized)
+        if results and isinstance(results, list) and len(results) > 0:
+            return results
+    # Try removing hyphen
+    no_hyphen = keyword.replace("-", "")
+    if no_hyphen != keyword:
+        results = erp_query("products", search=no_hyphen)
+        if results and isinstance(results, list) and len(results) > 0:
+            return results
+    return None
+
+
+def erp_search_products(keyword: str) -> str:
+    results = erp_search_with_fallback(keyword)
+    if not results:
         return f"找不到與「{keyword}」相關的商品。"
-    items = results[:10]  # max 10
+    items = results[:10]
     lines = [f"搜尋「{keyword}」找到 {len(results)} 項商品：\n"]
     for p in items:
         price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
@@ -889,7 +911,7 @@ async def callback(request: Request) -> dict:
                             kw = kw.strip()
                             if not kw:
                                 continue
-                            products = erp_query("products", search=kw)
+                            products = erp_search_with_fallback(kw)
                             if products and isinstance(products, list):
                                 for p in products[:2]:
                                     quote = erp_query("quote", code=target_alias, sku=p["sku"])
