@@ -686,7 +686,7 @@ def erp_download_pdf(quote_id: str) -> bytes | None:
     try:
         with httpx.Client(timeout=30) as client:
             resp = client.get(
-                f"{ERP_API_URL}?action=pdf&quoteId={quote_id}&template=minimal",
+                f"{ERP_API_URL}?action=pdf&quoteId={quote_id}&template=detailed",
                 headers={"Authorization": f"Bearer {ERP_API_TOKEN}"},
             )
             if resp.status_code == 200 and "pdf" in resp.headers.get("content-type", ""):
@@ -696,21 +696,8 @@ def erp_download_pdf(quote_id: str) -> bytes | None:
     return None
 
 
-async def send_pdf_to_line(to: str, pdf_bytes: bytes, filename: str) -> None:
-    """Upload PDF to LINE and send as file message."""
-    async with httpx.AsyncClient() as client:
-        # First upload to LINE's blob storage
-        resp = await client.post(
-            "https://api-data.line.me/v2/bot/message/push",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-            json={
-                "to": to,
-                "messages": [{
-                    "type": "text",
-                    "text": f"📄 報價單已建立，請查看上方訊息。",
-                }],
-            },
-        )
+# In-memory PDF cache for temporary download links
+pdf_cache: dict[str, bytes] = {}
 
 
 def erp_get_customer(customer_code: str) -> dict | None:
@@ -1239,21 +1226,27 @@ async def callback(request: Request) -> dict:
 
                     await reply_message(reply_token, "\n".join(lines))
 
-                    # Download and send PDF
-                    quote_id = result.get("pdfUrl", "")
-                    # Extract quoteId from pdfUrl
-                    id_match = re.search(r"/quotes/([^/]+)/pdf", quote_id)
+                    # Download PDF and create download link
+                    pdf_url_raw = result.get("pdfUrl", "")
+                    id_match = re.search(r"/quotes/([^/]+)/pdf", pdf_url_raw)
                     if id_match:
                         pdf_bytes = erp_download_pdf(id_match.group(1))
                         if pdf_bytes:
-                            # Push PDF info to admin group
-                            if admin_group:
-                                await push_message(
-                                    admin_group,
-                                    f"報價單 {result['quoteNumber']} 已建立\n"
-                                    f"客戶：{result['customer']['name']}\n"
-                                    f"金額：NT${result['totalAmount']:,}"
-                                )
+                            pdf_id = result["quoteNumber"]
+                            pdf_cache[pdf_id] = pdf_bytes
+                            download_url = f"https://web-production-87474.up.railway.app/pdf/{pdf_id}"
+                            await push_message(
+                                source_id,
+                                f"📄 報價單 PDF 下載連結：\n{download_url}"
+                            )
+                    # Notify admin group
+                    if admin_group and source_id != admin_group:
+                        await push_message(
+                            admin_group,
+                            f"報價單 {result['quoteNumber']} 已建立\n"
+                            f"客戶：{result['customer']['name']}\n"
+                            f"金額：NT${result['totalAmount']:,}"
+                        )
                 else:
                     err = result.get("error", "未知錯誤") if result else "無法連接 ERP"
                     await reply_message(reply_token, f"建立報價單失敗：{err}")
@@ -1430,6 +1423,17 @@ async def callback(request: Request) -> dict:
                 pass
 
     return {"status": "ok"}
+
+
+@app.get("/pdf/{pdf_id}")
+async def download_pdf(pdf_id: str):
+    from fastapi.responses import Response
+    pdf_bytes = pdf_cache.get(pdf_id)
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail="PDF not found or expired")
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={
+        "Content-Disposition": f"inline; filename={pdf_id}.pdf"
+    })
 
 
 @app.get("/health")
