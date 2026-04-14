@@ -946,6 +946,20 @@ async def callback(request: Request) -> dict:
                         await reply_message(reply_token, assistant_reply)
                     continue
 
+                # Admin group: auto-reply to product queries without prefix
+                if is_admin_group and is_product_query(user_text):
+                    try:
+                        erp_context = build_erp_context(user_text, source_id, allow_customer_pricing=True)
+                        system_msg = SYSTEM_PROMPT + erp_context
+                        msgs = [{"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_text}]
+                        assistant_reply = call_llm(msgs)
+                    except Exception as e:
+                        logger.error(f"Admin ERP query error: {e}")
+                        assistant_reply = "查詢失敗，請稍後再試。"
+                    await reply_message(reply_token, assistant_reply)
+                    continue
+
                 # Commitment extraction (silent monitoring)
                 extraction = extract_commitments(user_text, user_name)
                 if extraction and extraction.get("is_commitment"):
