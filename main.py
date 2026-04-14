@@ -119,6 +119,8 @@ class Staff(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(64), nullable=False, unique=True)
     user_name = Column(String(128), nullable=True)
+    email = Column(String(128), nullable=True)
+    role = Column(String(32), nullable=True)
 
 
 class Setting(Base):
@@ -156,6 +158,16 @@ def migrate_db():
     if "settings" not in insp.get_table_names():
         Base.metadata.tables["settings"].create(engine)
         logger.info("Created settings table")
+    if "staff" in insp.get_table_names():
+        cols = [c["name"] for c in insp.get_columns("staff")]
+        with engine.connect() as conn:
+            if "email" not in cols:
+                conn.execute(text("ALTER TABLE staff ADD COLUMN email VARCHAR(128)"))
+                logger.info("Added email column to staff")
+            if "role" not in cols:
+                conn.execute(text("ALTER TABLE staff ADD COLUMN role VARCHAR(32)"))
+                logger.info("Added role column to staff")
+            conn.commit()
 
 
 @asynccontextmanager
@@ -294,7 +306,7 @@ def set_setting(key: str, value: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register_staff(user_id: str, user_name: str) -> None:
+def register_staff(user_id: str, user_name: str, email: str = "", role: str = "") -> None:
     if not SessionLocal:
         return
     db = SessionLocal()
@@ -302,9 +314,24 @@ def register_staff(user_id: str, user_name: str) -> None:
         existing = db.query(Staff).filter_by(user_id=user_id).first()
         if existing:
             existing.user_name = user_name
+            if email:
+                existing.email = email
+            if role:
+                existing.role = role
         else:
-            db.add(Staff(user_id=user_id, user_name=user_name))
+            db.add(Staff(user_id=user_id, user_name=user_name, email=email, role=role))
         db.commit()
+    finally:
+        db.close()
+
+
+def get_staff_email(user_id: str) -> str:
+    if not SessionLocal:
+        return ""
+    db = SessionLocal()
+    try:
+        s = db.query(Staff).filter_by(user_id=user_id).first()
+        return s.email or "" if s else ""
     finally:
         db.close()
 
@@ -629,6 +656,63 @@ def erp_verify_staff(username: str, pin: str) -> dict | None:
     return None
 
 
+def erp_create_quote(customer_code: str, items: list[dict], created_by_email: str) -> dict | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                ERP_API_URL,
+                headers={
+                    "Authorization": f"Bearer {ERP_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "action": "create_quote",
+                    "customerCode": customer_code,
+                    "createdByEmail": created_by_email,
+                    "items": items,
+                },
+            )
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP create_quote failed: {e}")
+    return None
+
+
+def erp_download_pdf(quote_id: str) -> bytes | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(
+                f"{ERP_API_URL}?action=pdf&quoteId={quote_id}&template=minimal",
+                headers={"Authorization": f"Bearer {ERP_API_TOKEN}"},
+            )
+            if resp.status_code == 200 and "pdf" in resp.headers.get("content-type", ""):
+                return resp.content
+    except Exception as e:
+        logger.warning(f"ERP download_pdf failed: {e}")
+    return None
+
+
+async def send_pdf_to_line(to: str, pdf_bytes: bytes, filename: str) -> None:
+    """Upload PDF to LINE and send as file message."""
+    async with httpx.AsyncClient() as client:
+        # First upload to LINE's blob storage
+        resp = await client.post(
+            "https://api-data.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={
+                "to": to,
+                "messages": [{
+                    "type": "text",
+                    "text": f"📄 報價單已建立，請查看上方訊息。",
+                }],
+            },
+        )
+
+
 def erp_get_customer(customer_code: str) -> dict | None:
     result = erp_query("customer", code=customer_code)
     if isinstance(result, dict) and "error" not in result:
@@ -685,6 +769,7 @@ DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
+QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$")
 
 
 def cmd_report_all() -> str:
@@ -941,6 +1026,10 @@ async def callback(request: Request) -> dict:
                     "  $U7-Pro → 查建議售價",
                     "  $K01 U7-Pro → 查客戶專屬報價",
                     "",
+                    "【建立報價單】（員工限定）",
+                    "  報價 K01 U7-Pro x40",
+                    "  報價 K01 U7-Pro x40, U7-Lite x10",
+                    "",
                     "【遠端發話】（管理群組限定）",
                     "  @K01 訊息內容 → 發送到 K01 群組（自動潤飾）",
                     "",
@@ -982,7 +1071,7 @@ async def callback(request: Request) -> dict:
                     result = erp_verify_staff(state["username"], user_text)
                     del registration_state[user_id]
                     if result and result.get("verified"):
-                        register_staff(user_id, result["name"])
+                        register_staff(user_id, result["name"], result.get("email", ""), result.get("role", ""))
                         await reply_message(
                             reply_token,
                             f"驗證成功！已註冊 {result['name']} 為員工（{result.get('role', '')}）。\n\nBot 在群組中會區分你的訊息為「我方」。"
@@ -1076,6 +1165,69 @@ async def callback(request: Request) -> dict:
                     await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]：\n{polished}")
                 else:
                     await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
+                continue
+
+            # --- Create quote: 報價 K01 U7-Pro x40, U7-Lite x10 ---
+            qm = QUOTE_RE.match(user_text)
+            if qm and is_staff(user_id):
+                cust_code = qm.group(1).upper()
+                items_str = qm.group(2).strip()
+                # Parse items: "U7-Pro x40, U7-Lite x10" or "U7-Pro 40"
+                quote_items = []
+                for part in re.split(r"[,、]\s*", items_str):
+                    m_item = re.match(r"(.+?)\s*[xX×]\s*(\d+)", part.strip())
+                    if m_item:
+                        quote_items.append({"sku": m_item.group(1).strip(), "quantity": int(m_item.group(2))})
+                    else:
+                        m_simple = re.match(r"(.+?)\s+(\d+)$", part.strip())
+                        if m_simple:
+                            quote_items.append({"sku": m_simple.group(1).strip(), "quantity": int(m_simple.group(2))})
+
+                if not quote_items:
+                    await reply_message(reply_token, "格式錯誤。範例：報價 K01 U7-Pro x40, U7-Lite x10")
+                    continue
+
+                staff_email = get_staff_email(user_id)
+                if not staff_email:
+                    await reply_message(reply_token, "你的帳號沒有綁定 email，請重新「註冊員工」。")
+                    continue
+
+                result = erp_create_quote(cust_code, quote_items, staff_email)
+                if result and result.get("success"):
+                    lines = [
+                        f"報價單 {result['quoteNumber']} 已建立！\n",
+                        f"客戶：{result['customer']['name']}（{result['customer']['code']}）",
+                        f"建立者：{result.get('createdBy', '')}",
+                        "",
+                    ]
+                    for item in result.get("items", []):
+                        lines.append(
+                            f"• {item['sku']} x{item['quantity']}"
+                            f"  單價 NT${item['unitPrice']:,}"
+                            f"  小計 NT${item['lineTotal']:,}"
+                        )
+                    lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+
+                    await reply_message(reply_token, "\n".join(lines))
+
+                    # Download and send PDF
+                    quote_id = result.get("pdfUrl", "")
+                    # Extract quoteId from pdfUrl
+                    id_match = re.search(r"/quotes/([^/]+)/pdf", quote_id)
+                    if id_match:
+                        pdf_bytes = erp_download_pdf(id_match.group(1))
+                        if pdf_bytes:
+                            # Push PDF info to admin group
+                            if admin_group:
+                                await push_message(
+                                    admin_group,
+                                    f"報價單 {result['quoteNumber']} 已建立\n"
+                                    f"客戶：{result['customer']['name']}\n"
+                                    f"金額：NT${result['totalAmount']:,}"
+                                )
+                else:
+                    err = result.get("error", "未知錯誤") if result else "無法連接 ERP"
+                    await reply_message(reply_token, f"建立報價單失敗：{err}")
                 continue
 
             # --- $query → Price query ---
