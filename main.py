@@ -1087,8 +1087,11 @@ async def callback(request: Request) -> dict:
                 parsed_pq = parse_product_query(query_text)
                 explicit_customer = parsed_pq.get("customer_code")
 
-                if staff_user:
-                    # Staff can see any customer price
+                if staff_user and explicit_customer and is_admin_group:
+                    # Staff in admin group can query any customer price
+                    can_see_customer_price = True
+                elif staff_user and not explicit_customer:
+                    # Staff without specifying customer → use group's own price
                     can_see_customer_price = True
                 elif explicit_customer:
                     # Non-staff trying to query another customer's price → block
