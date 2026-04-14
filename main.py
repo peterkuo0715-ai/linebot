@@ -43,6 +43,19 @@ SYSTEM_PROMPT = (
     "請一律使用繁體中文回覆。"
 )
 
+QUERY_PARSE_PROMPT = """你是一個查詢解析助理。請從使用者的問題中提取：
+1. customer_code: 客戶代號（格式通常是英文字母+數字，例如 K10、C001），如果沒有提到則為 null
+2. product_keyword: 要查詢的商品關鍵字，如果沒有提到則為 null
+
+請以 JSON 格式回覆，不要包含其他文字：
+{{"customer_code": "K10", "product_keyword": "U7-Pro"}}
+
+範例：
+「K10的U7-Pro報多少」→ {{"customer_code": "K10", "product_keyword": "U7-Pro"}}
+「查一下UDR定價」→ {{"customer_code": null, "product_keyword": "UDR"}}
+「U7多少錢」→ {{"customer_code": null, "product_keyword": "U7"}}
+「K05 有什麼交換器」→ {{"customer_code": "K05", "product_keyword": "交換器"}}"""
+
 COMMITMENT_PROMPT = """你是一個專門分析對話的助理。你的任務是判斷以下訊息是否包含承諾、約定、待辦事項或任務。
 
 承諾的定義包括：
@@ -387,6 +400,22 @@ def erp_query(action: str, **params) -> dict | list | None:
     except Exception as e:
         logger.warning(f"ERP query failed: {e}")
     return None
+
+
+def parse_product_query(question: str) -> dict:
+    """Use LLM to extract customer_code and product_keyword from question."""
+    try:
+        raw = call_llm(
+            [{"role": "system", "content": QUERY_PARSE_PROMPT},
+             {"role": "user", "content": question}],
+            max_tokens=128,
+        )
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception as e:
+        logger.warning(f"Query parse failed: {e}")
+    return {"customer_code": None, "product_keyword": question}
 
 
 def erp_search_products(keyword: str) -> str:
@@ -821,8 +850,13 @@ async def callback(request: Request) -> dict:
                     question = user_text[len(HELPER_TRIGGER):].strip()
                     if question:
                         try:
+                            # Parse question to extract customer code + product keyword
+                            parsed = parse_product_query(question)
+                            customer_code = parsed.get("customer_code")
+                            keyword = parsed.get("product_keyword") or question
+
                             erp_context = ""
-                            products = erp_query("products", search=question)
+                            products = erp_query("products", search=keyword)
                             if products and isinstance(products, list) and len(products) > 0:
                                 plines = []
                                 for p in products[:5]:
@@ -830,19 +864,27 @@ async def callback(request: Request) -> dict:
                                     plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability','')}")
                                 erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答：\n" + "\n".join(plines)
 
-                            # Check customer-specific pricing
-                            alias_obj = None
-                            if SessionLocal:
-                                db = SessionLocal()
-                                try:
-                                    alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
-                                finally:
-                                    db.close()
-                            if alias_obj and products and isinstance(products, list):
+                            # Determine customer code: explicit > group alias
+                            if not customer_code:
+                                alias_obj = None
+                                if SessionLocal:
+                                    db = SessionLocal()
+                                    try:
+                                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                                    finally:
+                                        db.close()
+                                if alias_obj:
+                                    customer_code = alias_obj.alias
+
+                            # Get customer-specific quotes
+                            if customer_code and products and isinstance(products, list):
+                                customer_info = erp_get_customer(customer_code)
+                                if customer_info:
+                                    erp_context += f"\n客戶 {customer_code} 資訊：{json.dumps(customer_info, ensure_ascii=False)}"
                                 for p in products[:3]:
-                                    quote = erp_query("quote", code=alias_obj.alias, sku=p["sku"])
+                                    quote = erp_query("quote", code=customer_code, sku=p["sku"])
                                     if quote and isinstance(quote, dict) and "error" not in quote:
-                                        erp_context += f"\n此客戶({alias_obj.alias})的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
+                                        erp_context += f"\n客戶 {customer_code} 的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
 
                             system_msg = SYSTEM_PROMPT + erp_context
                             history = conversation_history.get(f"group_{source_id}", [])
