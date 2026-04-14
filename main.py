@@ -1191,17 +1191,29 @@ async def callback(request: Request) -> dict:
                         # Resolve SKU via ERP search fallback
                         products = erp_search_with_fallback(raw_sku)
                         if products and len(products) == 1:
-                            resolved_sku = products[0]["sku"]
+                            quote_items.append({"sku": products[0]["sku"], "quantity": qty})
                         elif products and len(products) > 1:
-                            # Try exact match first
                             exact = [p for p in products if p["sku"].lower() == raw_sku.lower().replace(" ", "-")]
-                            resolved_sku = exact[0]["sku"] if exact else products[0]["sku"]
+                            if exact:
+                                quote_items.append({"sku": exact[0]["sku"], "quantity": qty})
+                            else:
+                                # Multiple matches → ask user to choose
+                                options = "\n".join(
+                                    f"  {i+1}. {p['sku']} — {p['name']}"
+                                    for i, p in enumerate(products[:5])
+                                )
+                                await reply_message(
+                                    reply_token,
+                                    f"「{raw_sku}」找到多個商品，請用正確 SKU 重新報價：\n\n{options}"
+                                )
+                                quote_items = []
+                                break
                         else:
-                            resolved_sku = raw_sku
-                        quote_items.append({"sku": resolved_sku, "quantity": qty})
+                            await reply_message(reply_token, f"找不到商品「{raw_sku}」，請確認型號。")
+                            quote_items = []
+                            break
 
                 if not quote_items:
-                    await reply_message(reply_token, "格式錯誤。範例：報價 K01 U7-Pro x40, U7-Lite x10")
                     continue
 
                 staff_email = get_staff_email(user_id)
