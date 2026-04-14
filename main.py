@@ -1235,15 +1235,22 @@ async def callback(request: Request) -> dict:
                         if id_match:
                             quote_db_id = id_match.group(1)
                     if quote_db_id:
-                        pdf_bytes = erp_download_pdf(quote_db_id)
-                        if pdf_bytes:
-                            pdf_id = result["quoteNumber"]
-                            pdf_cache[pdf_id] = pdf_bytes
-                            download_url = f"https://web-production-87474.up.railway.app/pdf/{pdf_id}"
-                            await push_message(
-                                source_id,
-                                f"📄 報價單 PDF 下載連結：\n{download_url}"
-                            )
+                        try:
+                            pdf_bytes = erp_download_pdf(quote_db_id)
+                            if pdf_bytes:
+                                pdf_id = result["quoteNumber"]
+                                pdf_cache[pdf_id] = pdf_bytes
+                                download_url = f"https://web-production-87474.up.railway.app/pdf/{pdf_id}"
+                                await push_message(
+                                    source_id,
+                                    f"📄 報價單 PDF 下載連結：\n{download_url}"
+                                )
+                            else:
+                                logger.warning("PDF download returned empty")
+                                await push_message(source_id, "⚠ PDF 下載失敗，請到 ERP 系統查看。")
+                        except Exception as e:
+                            logger.error(f"PDF download/send error: {e}")
+                            await push_message(source_id, "⚠ PDF 產生中，請稍後到 ERP 系統下載。")
                     # Notify admin group
                     if admin_group and source_id != admin_group:
                         await push_message(
