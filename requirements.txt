@@ -1,5 +1,4 @@
 fastapi
 uvicorn
-anthropic
 httpx
 python-multipart
