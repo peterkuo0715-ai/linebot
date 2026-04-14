@@ -1169,9 +1169,23 @@ async def callback(request: Request) -> dict:
                     part = re.sub(r"^\d+[\.\)、]\s*", "", part.strip())  # Remove "1." "2)" etc.
                     if not part:
                         continue
-                    m_item = re.match(r"(.+?)\s*[xX×]\s*(\d+)", part)
+                    m_item = re.match(r"(.+?)\s*[xX×\*]\s*(\d+)\s*$", part)
                     if not m_item:
-                        m_item = re.match(r"(.+?)\s+(\d+)$", part)
+                        m_item = re.match(r"(.+?)\s+(\d+)\s*$", part)
+                    if not m_item:
+                        # No quantity specified, default to 1
+                        m_item = re.match(r"(.+)", part)
+                        if m_item and m_item.group(1).strip():
+                            raw_sku = m_item.group(1).strip()
+                            products = erp_search_with_fallback(raw_sku)
+                            if products:
+                                resolved_sku = products[0]["sku"]
+                                quote_items.append({"sku": resolved_sku, "quantity": 1})
+                            else:
+                                await reply_message(reply_token, f"找不到商品「{raw_sku}」，請確認型號。")
+                                quote_items = []
+                                break
+                            continue
                     if m_item:
                         raw_sku = m_item.group(1).strip()
                         qty = int(m_item.group(2))
@@ -1201,6 +1215,10 @@ async def callback(request: Request) -> dict:
                             break
 
                 if not quote_items:
+                    await push_message(
+                        source_id,
+                        "無法解析報價品項。格式範例：\n\n報價 K01\n1. UCK-G2-SSD x1\n2. USW-PRO-XG-10-POE x1\n\n或：報價 K01 UCK-G2-SSD *1, CKG2-RM *1"
+                    )
                     continue
 
                 staff_email = get_staff_email(user_id)
