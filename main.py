@@ -88,7 +88,10 @@ async def callback(request: Request) -> dict:
         user_text = event["message"]["text"]
         reply_token = event["replyToken"]
 
-        assistant_reply = chat_with_claude(user_id, user_text)
+        try:
+            assistant_reply = chat_with_claude(user_id, user_text)
+        except Exception as e:
+            assistant_reply = f"系統暫時無法回應，請稍後再試。（錯誤：{type(e).__name__}）"
         await reply_message(reply_token, assistant_reply)
 
     return {"status": "ok"}
