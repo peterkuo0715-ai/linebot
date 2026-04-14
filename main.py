@@ -877,16 +877,38 @@ async def callback(request: Request) -> dict:
                 msg_content = rm.group(2).strip()
                 target = get_group_by_alias(target_alias)
                 if target:
-                    # Query ERP if message is about products/pricing
                     erp_data = ""
                     if is_product_query(msg_content):
-                        erp_data = build_erp_context(msg_content, target.group_id, allow_customer_pricing=True)
+                        # Extract product keywords from message
+                        parsed = parse_product_query(msg_content)
+                        keywords = parsed.get("product_keyword") or msg_content
+                        # Search each keyword separately (split by 跟/和/、/,)
+                        all_keywords = re.split(r"[跟和、,\s]+", keywords)
+                        erp_lines = []
+                        for kw in all_keywords:
+                            kw = kw.strip()
+                            if not kw:
+                                continue
+                            products = erp_query("products", search=kw)
+                            if products and isinstance(products, list):
+                                for p in products[:2]:
+                                    quote = erp_query("quote", code=target_alias, sku=p["sku"])
+                                    if quote and isinstance(quote, dict) and "error" not in quote:
+                                        pr = quote.get("pricing", {})
+                                        erp_lines.append(
+                                            f"{p['sku']}：客戶價 NT${pr.get('unitPrice',0):,}"
+                                            f"（建議售價 NT${pr.get('msrp',0):,}，折扣 {pr.get('discount',0)}%）"
+                                            f"，{quote.get('availability','')}"
+                                        )
+                        if erp_lines:
+                            erp_data = "\n\nERP 報價資料（客戶 " + target_alias + "）：\n" + "\n".join(erp_lines)
+
                     system_prompt = (
                         "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
-                        "使用繁體中文。簡潔即可，不要太長。"
+                        "使用繁體中文。簡潔即可，不要太長。務必帶入實際價格數字。"
                     )
                     if erp_data:
-                        system_prompt += f"\n\n以下是 ERP 系統的資料，請將實際價格帶入訊息中：{erp_data}"
+                        system_prompt += erp_data
                     polished = call_llm([
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": msg_content},
