@@ -757,6 +757,7 @@ BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
 QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
+QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)  # 沒指定客戶代號
 
 
 def cmd_report_all() -> str:
@@ -1156,9 +1157,26 @@ async def callback(request: Request) -> dict:
 
             # --- Create quote: 報價 K01 U7-Pro x40, U7-Lite x10 ---
             qm = QUOTE_RE.match(user_text)
+            # Parse quote command
+            cust_code = None
+            items_str = None
             if qm and is_staff(user_id):
                 cust_code = qm.group(1).upper()
                 items_str = qm.group(2).strip()
+            elif not qm and is_staff(user_id):
+                # Try without customer code → use group alias
+                qm_nc = QUOTE_NO_CODE_RE.match(user_text)
+                if qm_nc and source_type == "group" and SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                    finally:
+                        db.close()
+                    if alias_obj:
+                        cust_code = alias_obj.alias
+                        items_str = qm_nc.group(1).strip()
+
+            if cust_code and items_str:
                 # Parse items - supports:
                 # "U7-Pro x40, U7-Lite x10" (comma separated)
                 # "1. U7-Pro x40\n2. 2216 x10" (numbered lines)
