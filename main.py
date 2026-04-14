@@ -933,7 +933,7 @@ async def callback(request: Request) -> dict:
 
         try:
             # --- Help command ---
-            if (user_text == "-BOT" or user_text == "-bot") and is_admin_group:
+            if (user_text == "-BOT" or user_text == "-bot") and is_admin_group and is_staff(user_id):
                 help_lines = [
                     "藍圈科技 Bot 指令一覽：",
                     "",
@@ -1004,7 +1004,7 @@ async def callback(request: Request) -> dict:
                 continue
 
             # --- Staff list (admin group) ---
-            if user_text == "員工名冊" and is_admin_group:
+            if user_text == "員工名冊" and is_admin_group and is_staff(user_id):
                 await reply_message(reply_token, list_staff())
                 continue
 
@@ -1031,7 +1031,7 @@ async def callback(request: Request) -> dict:
 
             # --- @K01 message → Remote message (LLM polished) ---
             rm = REMOTE_MSG_RE.match(user_text)
-            if rm and is_admin_group:
+            if rm and is_admin_group and is_staff(user_id):
                 target_alias = rm.group(1).upper()
                 msg_content = rm.group(2).strip()
                 target = get_group_by_alias(target_alias)
@@ -1080,7 +1080,7 @@ async def callback(request: Request) -> dict:
 
             # --- $query → Price query ---
             pq = PRICE_QUERY_RE.match(user_text)
-            if pq:
+            if pq and is_staff(user_id):
                 query_text = pq.group(1).strip()
                 can_see_customer_price = is_admin_group
                 if not can_see_customer_price and SessionLocal:
@@ -1102,13 +1102,13 @@ async def callback(request: Request) -> dict:
                 continue
 
             # --- Commands (admin group sees all, others see own) ---
-            if user_text in ("報告", "待辦清單"):
+            if user_text in ("報告", "待辦清單") and is_staff(user_id):
                 if is_admin_group:
                     await reply_message(reply_token, cmd_report_all())
                 else:
                     await reply_message(reply_token, cmd_report(source_id))
                 continue
-            if user_text == "本週報告":
+            if user_text == "本週報告" and is_staff(user_id):
                 if is_admin_group:
                     await reply_message(reply_token, cmd_weekly_report_all())
                 else:
