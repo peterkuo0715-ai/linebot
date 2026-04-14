@@ -107,11 +107,30 @@ if DATABASE_URL:
 scheduler = AsyncIOScheduler()
 
 
+def migrate_db():
+    """Add missing columns to existing tables."""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    if "commitments" in insp.get_table_names():
+        cols = [c["name"] for c in insp.get_columns("commitments")]
+        if "source_name" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE commitments ADD COLUMN source_name VARCHAR(128)"
+                ))
+                conn.commit()
+                logger.info("Added source_name column to commitments")
+    if "settings" not in insp.get_table_names():
+        Base.metadata.tables["settings"].create(engine)
+        logger.info("Created settings table")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if engine:
         Base.metadata.create_all(engine)
-        logger.info("Database tables created")
+        migrate_db()
+        logger.info("Database tables ready")
     scheduler.add_job(
         daily_report_job,
         CronTrigger(hour=9, minute=0, timezone="Asia/Taipei"),
