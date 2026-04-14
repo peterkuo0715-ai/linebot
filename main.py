@@ -815,10 +815,44 @@ async def callback(request: Request) -> dict:
         is_admin_group = admin_group and source_id == admin_group
 
         try:
+            # --- Help command ---
+            if user_text == "-BOT" or user_text == "-bot":
+                help_lines = [
+                    "藍圈科技 Bot 指令一覽：",
+                    "",
+                    "【查價】",
+                    "  $U7-Pro → 查建議售價",
+                    "  $K01 U7-Pro → 查客戶專屬報價",
+                    "",
+                    "【遠端發話】（管理群組限定）",
+                    "  @K01 訊息內容 → 發送到 K01 群組（自動潤飾）",
+                    "",
+                    "【待辦管理】",
+                    "  報告 → 查看所有待辦",
+                    "  本週報告 → 本週到期事項",
+                    "  完成 #1 → 標記完成",
+                    "  刪除 #1 → 刪除事項",
+                    "",
+                    "【群組管理】",
+                    "  綁定 K01 → 綁定群組編號",
+                    "  群組列表 → 查看所有綁定群組",
+                    "  設定為管理群組 → 設定為管理中心",
+                    "",
+                    "【AI 對話】",
+                    "  小幫手 問題 → AI 回覆（群組用）",
+                    "  直接打字 → AI 回覆（私訊用）",
+                    "",
+                    "【自動功能】",
+                    "  • 群組承諾自動擷取記錄",
+                    "  • 每天早上 9:00 推播待辦報告",
+                ]
+                await reply_message(reply_token, "\n".join(help_lines))
+                continue
+
             # --- Admin group setup command ---
             if user_text == "設定為管理群組" and source_type == "group":
                 set_setting("admin_group_id", source_id)
-                await reply_message(reply_token, "已設定此群組為管理群組！\n\n所有群組的承諾記錄和每日報告都會發送到這裡。\n\n可用指令：\n• 報告 — 所有待辦\n• 本週報告 — 本週到期\n• 完成 #N — 標記完成\n• 刪除 #N — 刪除事項\n• 群組列表 — 查看所有綁定群組\n• G10 訊息內容 — 發話到指定群組")
+                await reply_message(reply_token, "已設定此群組為管理群組！\n\n輸入 -BOT 查看所有可用指令。")
                 continue
 
             # --- Bind group alias (in any group) ---
