@@ -769,7 +769,7 @@ DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
-QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$")
+QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 
 
 def cmd_report_all() -> str:
@@ -1172,16 +1172,33 @@ async def callback(request: Request) -> dict:
             if qm and is_staff(user_id):
                 cust_code = qm.group(1).upper()
                 items_str = qm.group(2).strip()
-                # Parse items: "U7-Pro x40, U7-Lite x10" or "U7-Pro 40"
+                # Parse items - supports:
+                # "U7-Pro x40, U7-Lite x10" (comma separated)
+                # "1. U7-Pro x40\n2. 2216 x10" (numbered lines)
                 quote_items = []
-                for part in re.split(r"[,、]\s*", items_str):
-                    m_item = re.match(r"(.+?)\s*[xX×]\s*(\d+)", part.strip())
+                # Split by newlines, commas, or 、
+                parts = re.split(r"[\n,、]+", items_str)
+                for part in parts:
+                    part = re.sub(r"^\d+[\.\)、]\s*", "", part.strip())  # Remove "1." "2)" etc.
+                    if not part:
+                        continue
+                    m_item = re.match(r"(.+?)\s*[xX×]\s*(\d+)", part)
+                    if not m_item:
+                        m_item = re.match(r"(.+?)\s+(\d+)$", part)
                     if m_item:
-                        quote_items.append({"sku": m_item.group(1).strip(), "quantity": int(m_item.group(2))})
-                    else:
-                        m_simple = re.match(r"(.+?)\s+(\d+)$", part.strip())
-                        if m_simple:
-                            quote_items.append({"sku": m_simple.group(1).strip(), "quantity": int(m_simple.group(2))})
+                        raw_sku = m_item.group(1).strip()
+                        qty = int(m_item.group(2))
+                        # Resolve SKU via ERP search fallback
+                        products = erp_search_with_fallback(raw_sku)
+                        if products and len(products) == 1:
+                            resolved_sku = products[0]["sku"]
+                        elif products and len(products) > 1:
+                            # Try exact match first
+                            exact = [p for p in products if p["sku"].lower() == raw_sku.lower().replace(" ", "-")]
+                            resolved_sku = exact[0]["sku"] if exact else products[0]["sku"]
+                        else:
+                            resolved_sku = raw_sku
+                        quote_items.append({"sku": resolved_sku, "quantity": qty})
 
                 if not quote_items:
                     await reply_message(reply_token, "格式錯誤。範例：報價 K01 U7-Pro x40, U7-Lite x10")
