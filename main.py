@@ -184,6 +184,9 @@ app = FastAPI(lifespan=lifespan)
 conversation_history: dict[str, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 
+# Registration state: user_id → {"step": "username"|"pin", "username": "..."}
+registration_state: dict[str, dict] = {}
+
 # ---------------------------------------------------------------------------
 # LINE helpers
 # ---------------------------------------------------------------------------
@@ -606,6 +609,26 @@ def erp_get_quote(customer_code: str, sku: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def erp_verify_staff(username: str, pin: str) -> dict | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                ERP_API_URL,
+                headers={
+                    "Authorization": f"Bearer {ERP_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={"action": "verify_staff", "username": username, "pin": pin},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP verify_staff failed: {e}")
+    return None
+
+
 def erp_get_customer(customer_code: str) -> dict | None:
     result = erp_query("customer", code=customer_code)
     if isinstance(result, dict) and "error" not in result:
@@ -947,11 +970,31 @@ async def callback(request: Request) -> dict:
                 await reply_message(reply_token, "\n".join(help_lines))
                 continue
 
-            # --- Staff registration (1:1 only) ---
+            # --- Staff registration with ERP verification (1:1 only) ---
+            if source_type == "user" and user_id in registration_state:
+                state = registration_state[user_id]
+                if state["step"] == "username":
+                    state["username"] = user_text
+                    state["step"] = "pin"
+                    await reply_message(reply_token, "請輸入你的 LINE Bot 驗證碼（PIN）：")
+                    continue
+                elif state["step"] == "pin":
+                    result = erp_verify_staff(state["username"], user_text)
+                    del registration_state[user_id]
+                    if result and result.get("verified"):
+                        register_staff(user_id, result["name"])
+                        await reply_message(
+                            reply_token,
+                            f"驗證成功！已註冊 {result['name']} 為員工（{result.get('role', '')}）。\n\nBot 在群組中會區分你的訊息為「我方」。"
+                        )
+                    else:
+                        err = result.get("error", "驗證失敗") if result else "無法連接 ERP"
+                        await reply_message(reply_token, f"驗證失敗：{err}\n\n請重新輸入「註冊員工」再試。")
+                    continue
+
             if user_text == "註冊員工" and source_type == "user":
-                uname = await get_user_name(user_id)
-                register_staff(user_id, uname)
-                await reply_message(reply_token, f"已註冊 {uname} 為員工！\n\nBot 在群組中會區分你的訊息為「我方」。")
+                registration_state[user_id] = {"step": "username"}
+                await reply_message(reply_token, "請輸入你的 ERP 帳號（姓名或 email）：")
                 continue
             if user_text == "取消員工" and source_type == "user":
                 if unregister_staff(user_id):
