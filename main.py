@@ -1080,10 +1080,11 @@ async def callback(request: Request) -> dict:
 
             # --- $query → Price query ---
             pq = PRICE_QUERY_RE.match(user_text)
-            if pq and is_staff(user_id):
+            if pq:
                 query_text = pq.group(1).strip()
-                can_see_customer_price = is_admin_group
-                if not can_see_customer_price and SessionLocal:
+                staff_user = is_staff(user_id)
+                can_see_customer_price = staff_user and (is_admin_group or False)
+                if not can_see_customer_price and staff_user and SessionLocal:
                     db = SessionLocal()
                     try:
                         can_see_customer_price = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
