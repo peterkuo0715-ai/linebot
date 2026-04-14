@@ -429,8 +429,12 @@ def is_product_query(text: str) -> bool:
     return bool(PRICE_KEYWORDS.search(text))
 
 
-def build_erp_context(question: str, group_source_id: str | None = None) -> str:
-    """Query ERP and build context string for LLM."""
+def build_erp_context(question: str, group_source_id: str | None = None,
+                      allow_customer_pricing: bool = False) -> str:
+    """Query ERP and build context string for LLM.
+
+    allow_customer_pricing: only True for admin group or groups with alias.
+    """
     parsed = parse_product_query(question)
     customer_code = parsed.get("customer_code")
     keyword = parsed.get("product_keyword") or question
@@ -445,6 +449,10 @@ def build_erp_context(question: str, group_source_id: str | None = None) -> str:
         price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
         plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability', '')}")
     erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答，不要捏造價格：\n" + "\n".join(plines)
+
+    if not allow_customer_pricing:
+        erp_context += "\n注意：此用戶沒有客戶專屬定價權限，只提供建議售價。"
+        return erp_context
 
     # Determine customer code: explicit in question > group alias
     if not customer_code and group_source_id and SessionLocal:
@@ -870,7 +878,7 @@ async def callback(request: Request) -> dict:
                 try:
                     erp_context = ""
                     if is_product_query(user_text):
-                        erp_context = build_erp_context(user_text)
+                        erp_context = build_erp_context(user_text, allow_customer_pricing=False)
                     system_msg = SYSTEM_PROMPT + erp_context
                     history = conversation_history[user_id]
                     history.append({"role": "user", "content": user_text})
@@ -912,7 +920,17 @@ async def callback(request: Request) -> dict:
                     question = user_text[len(HELPER_TRIGGER):].strip()
                     if question:
                         try:
-                            erp_context = build_erp_context(question, source_id)
+                            has_alias = False
+                            if SessionLocal:
+                                db = SessionLocal()
+                                try:
+                                    has_alias = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
+                                finally:
+                                    db.close()
+                            erp_context = build_erp_context(
+                                question, source_id,
+                                allow_customer_pricing=(is_admin_group or has_alias),
+                            )
                             system_msg = SYSTEM_PROMPT + erp_context
                             history = conversation_history.get(f"group_{source_id}", [])
                             history.append({"role": "user", "content": question})
