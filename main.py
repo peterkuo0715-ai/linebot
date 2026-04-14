@@ -1286,6 +1286,25 @@ async def callback(request: Request) -> dict:
                         except Exception as e:
                             logger.error(f"PDF download/send error: {e}")
                             await push_message(source_id, "⚠ PDF 產生中，請稍後到 ERP 系統下載。")
+                    # Send quote to customer group
+                    target_group = get_group_by_alias(cust_code)
+                    if target_group and target_group.group_id != source_id:
+                        # Build customer-facing message
+                        cust_lines = [
+                            f"您好，以下是您的報價單 {result['quoteNumber']}：\n",
+                        ]
+                        for item in result.get("items", []):
+                            cust_lines.append(
+                                f"• {item['name']} x{item['quantity']}"
+                                f"  NT${item['unitPrice']:,}"
+                            )
+                        cust_lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+                        if quote_db_id:
+                            dl = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
+                            cust_lines.append(f"\n📄 報價單下載：{dl}")
+                        cust_lines.append("\n如有任何問題請隨時告知，謝謝！")
+                        await push_message(target_group.group_id, "\n".join(cust_lines))
+
                     # Notify admin group
                     if admin_group and source_id != admin_group:
                         await push_message(
