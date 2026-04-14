@@ -1227,10 +1227,15 @@ async def callback(request: Request) -> dict:
                     await reply_message(reply_token, "\n".join(lines))
 
                     # Download PDF and create download link
-                    pdf_url_raw = result.get("pdfUrl", "")
-                    id_match = re.search(r"/quotes/([^/]+)/pdf", pdf_url_raw)
-                    if id_match:
-                        pdf_bytes = erp_download_pdf(id_match.group(1))
+                    pdf_url_raw = result.get("pdfDownload") or result.get("pdfUrl") or ""
+                    quote_db_id = result.get("quoteId") or ""
+                    # Extract quoteId from URL or use direct field
+                    if not quote_db_id:
+                        id_match = re.search(r"quoteId=([^&]+)", pdf_url_raw)
+                        if id_match:
+                            quote_db_id = id_match.group(1)
+                    if quote_db_id:
+                        pdf_bytes = erp_download_pdf(quote_db_id)
                         if pdf_bytes:
                             pdf_id = result["quoteNumber"]
                             pdf_cache[pdf_id] = pdf_bytes
