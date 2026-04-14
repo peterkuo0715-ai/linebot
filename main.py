@@ -1009,14 +1009,14 @@ async def callback(request: Request) -> dict:
                 continue
 
             # --- Admin group setup command ---
-            if user_text == "設定為管理群組" and source_type == "group":
+            if user_text == "設定為管理群組" and source_type == "group" and is_staff(user_id):
                 set_setting("admin_group_id", source_id)
                 await reply_message(reply_token, "已設定此群組為管理群組！\n\n輸入 -BOT 查看所有可用指令。")
                 continue
 
             # --- Bind group alias (in any group) ---
             bm = BIND_RE.match(user_text)
-            if bm and source_type == "group":
+            if bm and source_type == "group" and is_staff(user_id):
                 alias = bm.group(1).upper()
                 custom_name = bm.group(2)
                 gname = custom_name if custom_name else await get_group_name(source_id)
