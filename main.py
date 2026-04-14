@@ -49,11 +49,13 @@ COMMITMENT_PROMPT = """你是一個專門分析對話的助理。你的任務是
 - 分配任務（例如：「小明負責寫文件」）
 - 設定截止日期（例如：「下週一前完成」）
 - 客戶要求或老闆交代的事項
+- 明確要求記錄的事項（例如：「幫我記錄...」）
 
 不算承諾的例子：
 - 一般問候或閒聊
 - 提問（「什麼時候開會？」）
 - 描述過去已完成的事
+- 抱怨或情緒發洩
 
 請以以下 JSON 格式回覆，不要包含其他文字：
 {{"is_commitment": true, "items": [{{"content": "承諾的具體內容", "due_date": "YYYY-MM-DD 或 null", "assignee": "負責人名稱 或 null"}}]}}
@@ -62,6 +64,8 @@ COMMITMENT_PROMPT = """你是一個專門分析對話的助理。你的任務是
 如果提到「明天」，請換算成具體日期。
 如果提到「下週X」，請換算成具體日期。
 如果沒有找到任何承諾，回傳 {{"is_commitment": false, "items": []}}"""
+
+HELPER_TRIGGER = "小幫手"
 
 # ---------------------------------------------------------------------------
 # Database
@@ -75,6 +79,7 @@ class Commitment(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     source_type = Column(String(10), nullable=False)
     source_id = Column(String(64), nullable=False)
+    source_name = Column(String(128), nullable=True)
     user_id = Column(String(64), nullable=False)
     user_name = Column(String(128), nullable=True)
     content = Column(Text, nullable=False)
@@ -83,11 +88,10 @@ class Commitment(Base):
     created_at = Column(DateTime, default=func.now())
 
 
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    source_type = Column(String(10), nullable=False)
-    source_id = Column(String(64), nullable=False, unique=True)
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, nullable=False)
 
 
 engine = None
@@ -188,6 +192,48 @@ async def get_user_name(user_id: str, group_id: str | None = None) -> str:
     return "未知"
 
 
+async def get_group_name(group_id: str) -> str:
+    url = f"https://api.line.me/v2/bot/group/{group_id}/summary"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        )
+        if resp.status_code == 200:
+            return resp.json().get("groupName", "未知群組")
+    return "未知群組"
+
+
+# ---------------------------------------------------------------------------
+# Settings helpers
+# ---------------------------------------------------------------------------
+
+
+def get_setting(key: str) -> str | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        s = db.query(Setting).filter_by(key=key).first()
+        return s.value if s else None
+    finally:
+        db.close()
+
+
+def set_setting(key: str, value: str) -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        s = db.query(Setting).filter_by(key=key).first()
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+        db.commit()
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
@@ -236,7 +282,6 @@ def extract_commitments(message_text: str, user_name: str) -> dict | None:
              {"role": "user", "content": user_msg}],
             max_tokens=512,
         )
-        # Try to extract JSON from markdown code fences
         json_match = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
         json_str = json_match.group(1).strip() if json_match else raw.strip()
         return json.loads(json_str)
@@ -250,22 +295,9 @@ def extract_commitments(message_text: str, user_name: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def ensure_subscription(source_type: str, source_id: str) -> None:
-    if not SessionLocal:
-        return
-    db = SessionLocal()
-    try:
-        existing = db.query(Subscription).filter_by(source_id=source_id).first()
-        if not existing:
-            db.add(Subscription(source_type=source_type, source_id=source_id))
-            db.commit()
-    finally:
-        db.close()
-
-
 def save_commitments(
     extraction: dict, source_type: str, source_id: str,
-    user_id: str, user_name: str,
+    user_id: str, user_name: str, source_name: str = "",
 ) -> list[Commitment]:
     if not SessionLocal:
         return []
@@ -282,6 +314,7 @@ def save_commitments(
             c = Commitment(
                 source_type=source_type,
                 source_id=source_id,
+                source_name=source_name,
                 user_id=user_id,
                 user_name=item.get("assignee") or user_name,
                 content=item["content"],
@@ -305,6 +338,31 @@ COMPLETE_RE = re.compile(r"^完成\s*#?(\d+)$")
 DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 
 
+def cmd_report_all() -> str:
+    """管理群組用：列出所有群組的待辦"""
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        items = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .order_by(Commitment.created_at)
+            .all()
+        )
+        if not items:
+            return "目前沒有待辦事項。"
+        lines = ["全部待辦清單：\n"]
+        for c in items:
+            due = f"（截止：{c.due_date}）" if c.due_date else ""
+            source = f"[{c.source_name}] " if c.source_name else ""
+            assignee = f"{c.user_name}: " if c.user_name else ""
+            lines.append(f"#{c.id} {source}{assignee}{c.content} {due}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
 def cmd_report(source_id: str) -> str:
     if not SessionLocal:
         return "資料庫未連線，無法查詢。"
@@ -323,6 +381,43 @@ def cmd_report(source_id: str) -> str:
             due = f"（截止：{c.due_date}）" if c.due_date else ""
             assignee = f"[{c.user_name}] " if c.user_name else ""
             lines.append(f"#{c.id} {assignee}{c.content} {due}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def cmd_weekly_report_all() -> str:
+    """管理群組用：列出所有群組本週待辦"""
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        today = date.today()
+        end_of_week = today + timedelta(days=(6 - today.weekday()))
+        items = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .filter(Commitment.due_date <= end_of_week)
+            .order_by(Commitment.due_date)
+            .all()
+        )
+        overdue = [c for c in items if c.due_date and c.due_date < today]
+        this_week = [c for c in items if c not in overdue]
+
+        if not items:
+            return "本週沒有到期的待辦事項。"
+
+        lines = ["本週報告（所有群組）：\n"]
+        if overdue:
+            lines.append("⚠ 已逾期：")
+            for c in overdue:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
+        if this_week:
+            lines.append("本週到期：")
+            for c in this_week:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
         return "\n".join(lines)
     finally:
         db.close()
@@ -362,16 +457,12 @@ def cmd_weekly_report(source_id: str) -> str:
         db.close()
 
 
-def cmd_complete(item_id: int, source_id: str) -> str:
+def cmd_complete(item_id: int) -> str:
     if not SessionLocal:
         return "資料庫未連線。"
     db = SessionLocal()
     try:
-        c = (
-            db.query(Commitment)
-            .filter_by(id=item_id, source_id=source_id, status="pending")
-            .first()
-        )
+        c = db.query(Commitment).filter_by(id=item_id, status="pending").first()
         if not c:
             return f"找不到待辦事項 #{item_id}，或該事項已完成/刪除。"
         c.status = "done"
@@ -381,16 +472,12 @@ def cmd_complete(item_id: int, source_id: str) -> str:
         db.close()
 
 
-def cmd_delete(item_id: int, source_id: str) -> str:
+def cmd_delete(item_id: int) -> str:
     if not SessionLocal:
         return "資料庫未連線。"
     db = SessionLocal()
     try:
-        c = (
-            db.query(Commitment)
-            .filter_by(id=item_id, source_id=source_id, status="pending")
-            .first()
-        )
+        c = db.query(Commitment).filter_by(id=item_id, status="pending").first()
         if not c:
             return f"找不到待辦事項 #{item_id}，或該事項已完成/刪除。"
         c.status = "deleted"
@@ -401,49 +488,56 @@ def cmd_delete(item_id: int, source_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Daily report job
+# Daily report job → push to admin group only
 # ---------------------------------------------------------------------------
 
 
 async def daily_report_job():
     if not SessionLocal:
         return
+    admin_group = get_setting("admin_group_id")
+    if not admin_group:
+        logger.info("No admin group set, skipping daily report")
+        return
+
     db = SessionLocal()
     try:
-        subs = db.query(Subscription).all()
         today = date.today()
+        pending = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .order_by(Commitment.due_date.nulls_last(), Commitment.created_at)
+            .all()
+        )
+        if not pending:
+            await push_message(admin_group, "每日待辦報告：\n\n目前沒有待辦事項。")
+            return
 
-        for sub in subs:
-            pending = (
-                db.query(Commitment)
-                .filter_by(source_id=sub.source_id, status="pending")
-                .order_by(Commitment.due_date.nulls_last(), Commitment.created_at)
-                .all()
-            )
-            if not pending:
-                continue
+        overdue = [c for c in pending if c.due_date and c.due_date < today]
+        today_items = [c for c in pending if c.due_date == today]
+        other = [c for c in pending if c not in overdue and c not in today_items]
 
-            overdue = [c for c in pending if c.due_date and c.due_date < today]
-            today_items = [c for c in pending if c.due_date == today]
-            other = [c for c in pending if c not in overdue and c not in today_items]
+        lines = ["每日待辦報告：\n"]
+        if overdue:
+            lines.append("⚠ 逾期：")
+            for c in overdue:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
+        if today_items:
+            lines.append("今日到期：")
+            for c in today_items:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}")
+        if other:
+            lines.append("待處理：")
+            for c in other:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                due = f"（截止：{c.due_date}）" if c.due_date else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content} {due}")
 
-            lines = ["每日待辦報告：\n"]
-            if overdue:
-                lines.append("⚠ 逾期：")
-                for c in overdue:
-                    lines.append(f"  #{c.id} [{c.user_name}] {c.content}（截止：{c.due_date}）")
-            if today_items:
-                lines.append("今日到期：")
-                for c in today_items:
-                    lines.append(f"  #{c.id} [{c.user_name}] {c.content}")
-            if other:
-                lines.append("待處理：")
-                for c in other:
-                    due = f"（截止：{c.due_date}）" if c.due_date else ""
-                    lines.append(f"  #{c.id} [{c.user_name}] {c.content} {due}")
-
-            await push_message(sub.source_id, "\n".join(lines))
-            logger.info(f"Daily report sent to {sub.source_id}")
+        lines.append(f"\n共 {len(pending)} 項待辦")
+        await push_message(admin_group, "\n".join(lines))
+        logger.info("Daily report sent to admin group")
     except Exception as e:
         logger.error(f"Daily report job failed: {e}")
     finally:
@@ -464,6 +558,7 @@ async def callback(request: Request) -> dict:
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
+    admin_group = get_setting("admin_group_id")
 
     for event in data.get("events", []):
         if event["type"] != "message" or event["message"]["type"] != "text":
@@ -485,28 +580,39 @@ async def callback(request: Request) -> dict:
 
         user_text = event["message"]["text"].strip()
         reply_token = event["replyToken"]
+        is_admin_group = admin_group and source_id == admin_group
 
-        # Auto-register subscription
-        ensure_subscription(source_type, source_id)
+        # --- Admin group setup command ---
+        if user_text == "設定為管理群組" and source_type == "group":
+            set_setting("admin_group_id", source_id)
+            await reply_message(reply_token, "已設定此群組為管理群組！\n\n所有群組的承諾記錄和每日報告都會發送到這裡。\n\n可用指令：\n• 報告 — 所有待辦\n• 本週報告 — 本週到期\n• 完成 #N — 標記完成\n• 刪除 #N — 刪除事項")
+            continue
 
-        # --- Command handling ---
+        # --- Commands (admin group sees all, others see own) ---
         if user_text in ("報告", "待辦清單"):
-            await reply_message(reply_token, cmd_report(source_id))
+            if is_admin_group:
+                await reply_message(reply_token, cmd_report_all())
+            else:
+                await reply_message(reply_token, cmd_report(source_id))
             continue
         if user_text == "本週報告":
-            await reply_message(reply_token, cmd_weekly_report(source_id))
+            if is_admin_group:
+                await reply_message(reply_token, cmd_weekly_report_all())
+            else:
+                await reply_message(reply_token, cmd_weekly_report(source_id))
             continue
         m = COMPLETE_RE.match(user_text)
         if m:
-            await reply_message(reply_token, cmd_complete(int(m.group(1)), source_id))
+            await reply_message(reply_token, cmd_complete(int(m.group(1))))
             continue
         m = DELETE_RE.match(user_text)
         if m:
-            await reply_message(reply_token, cmd_delete(int(m.group(1)), source_id))
+            await reply_message(reply_token, cmd_delete(int(m.group(1))))
             continue
 
         # --- 1:1 chat: conversation + commitment extraction ---
         if source_type == "user":
+            # Check if starts with 小幫手 (for consistency, also works in 1:1)
             try:
                 assistant_reply = chat_with_llm(user_id, user_text)
             except Exception as e:
@@ -514,28 +620,61 @@ async def callback(request: Request) -> dict:
                 assistant_reply = "系統暫時無法回應，請稍後再試。"
             await reply_message(reply_token, assistant_reply)
 
-            # Background commitment extraction
+            # Commitment extraction
             user_name = await get_user_name(user_id)
             extraction = extract_commitments(user_text, user_name)
             if extraction and extraction.get("is_commitment"):
                 items = extraction.get("items", [])
                 items_text = "、".join(i["content"] for i in items)
                 save_commitments(
-                    extraction, source_type, source_id, user_id, user_name
+                    extraction, source_type, source_id, user_id, user_name,
+                    source_name="私訊",
                 )
                 await push_message(user_id, f"已記錄待辦：{items_text}")
+                # Forward to admin group
+                if admin_group:
+                    await push_message(
+                        admin_group,
+                        f"[私訊] {user_name} 新增待辦：{items_text}",
+                    )
 
-        # --- Group chat: commitment extraction only ---
+        # --- Group chat ---
         elif source_type in ("group", "room"):
             user_name = await get_user_name(user_id, group_id)
+            group_name = await get_group_name(source_id) if source_type == "group" else "聊天室"
+
+            # 「小幫手」trigger → conversation reply in group
+            if user_text.startswith(HELPER_TRIGGER):
+                question = user_text[len(HELPER_TRIGGER):].strip()
+                if question:
+                    try:
+                        assistant_reply = chat_with_llm(
+                            f"group_{source_id}", question
+                        )
+                    except Exception as e:
+                        logger.error(f"LLM chat error: {e}")
+                        assistant_reply = "系統暫時無法回應，請稍後再試。"
+                    await reply_message(reply_token, assistant_reply)
+                continue
+
+            # Commitment extraction (silent monitoring)
             extraction = extract_commitments(user_text, user_name)
             if extraction and extraction.get("is_commitment"):
                 items = extraction.get("items", [])
                 items_text = "、".join(i["content"] for i in items)
                 save_commitments(
-                    extraction, source_type, source_id, user_id, user_name
+                    extraction, source_type, source_id, user_id, user_name,
+                    source_name=group_name,
                 )
-                await reply_message(reply_token, f"已記錄：{items_text}")
+                # Reply in the group
+                if not is_admin_group:
+                    await reply_message(reply_token, f"已記錄：{items_text}")
+                # Forward to admin group
+                if admin_group and not is_admin_group:
+                    await push_message(
+                        admin_group,
+                        f"[{group_name}] {user_name} 新增待辦：{items_text}",
+                    )
 
     return {"status": "ok"}
 
