@@ -1113,6 +1113,80 @@ async def callback(request: Request) -> dict:
                 msg_content = rm.group(2).strip()
                 target = get_group_by_alias(target_alias)
                 if target:
+                    # @K01 報價 ... → create quote and send to customer group
+                    if msg_content.startswith("報價"):
+                        quote_items_str = msg_content[2:].strip()
+                        if not quote_items_str:
+                            await reply_message(reply_token, f"請提供品項。範例：@K01 報價\n1. U7-Pro x40\n2. U7-Lite x10")
+                            continue
+                        # Reuse quote parsing logic
+                        q_items = []
+                        parts = re.split(r"[\n,、]+", quote_items_str)
+                        parse_ok = True
+                        for part in parts:
+                            part = re.sub(r"^\d+[\.\)、]\s*", "", part.strip())
+                            if not part:
+                                continue
+                            m_item = re.match(r"(.+?)\s*[xX×\*]\s*(\d+)\s*$", part)
+                            if not m_item:
+                                m_item = re.match(r"(.+?)\s+(\d+)\s*$", part)
+                            if m_item:
+                                raw_sku = m_item.group(1).strip()
+                                qty = int(m_item.group(2))
+                            else:
+                                raw_sku = part.strip()
+                                qty = 1
+                            products = erp_search_with_fallback(raw_sku)
+                            if products and len(products) == 1:
+                                q_items.append({"sku": products[0]["sku"], "quantity": qty})
+                            elif products and len(products) > 1:
+                                exact = [p for p in products if p["sku"].lower() == raw_sku.lower().replace(" ", "-")]
+                                if exact:
+                                    q_items.append({"sku": exact[0]["sku"], "quantity": qty})
+                                else:
+                                    options = "\n".join(f"  {i+1}. {p['sku']}" for i, p in enumerate(products[:5]))
+                                    await reply_message(reply_token, f"「{raw_sku}」找到多個商品：\n{options}\n請用正確 SKU 重試。")
+                                    parse_ok = False
+                                    break
+                            else:
+                                await reply_message(reply_token, f"找不到商品「{raw_sku}」")
+                                parse_ok = False
+                                break
+                        if not parse_ok or not q_items:
+                            continue
+                        staff_email = get_staff_email(user_id)
+                        if not staff_email:
+                            await reply_message(reply_token, "你的帳號沒有綁定 email，請重新「註冊員工」。")
+                            continue
+                        result = erp_create_quote(target_alias, q_items, staff_email)
+                        if result and result.get("success"):
+                            # Reply to admin group
+                            lines = [f"報價單 {result['quoteNumber']} 已建立！\n",
+                                     f"客戶：{result['customer']['name']}（{target_alias}）"]
+                            for item in result.get("items", []):
+                                lines.append(f"• {item['sku']} x{item['quantity']} 單價 NT${item['unitPrice']:,} 小計 NT${item['lineTotal']:,}")
+                            lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+                            quote_db_id = result.get("quoteId", "")
+                            pdf_dl = ""
+                            if quote_db_id:
+                                pdf_dl = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
+                                lines.append(f"📄 PDF：{pdf_dl}")
+                            await reply_message(reply_token, "\n".join(lines))
+                            # Send to customer group
+                            cust_lines = [f"您好，以下是您的報價單 {result['quoteNumber']}：\n"]
+                            for item in result.get("items", []):
+                                cust_lines.append(f"• {item['name']} x{item['quantity']}  NT${item['unitPrice']:,}")
+                            cust_lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+                            if pdf_dl:
+                                cust_lines.append(f"\n📄 報價單下載：{pdf_dl}")
+                            cust_lines.append("\n如有任何問題請隨時告知，謝謝！")
+                            await push_message(target.group_id, "\n".join(cust_lines))
+                            await push_message(source_id, f"已發送報價單到 [{target_alias} {target.group_name}]")
+                        else:
+                            err = result.get("error", "未知錯誤") if result else "無法連接 ERP"
+                            await reply_message(reply_token, f"建立報價單失敗：{err}")
+                        continue
+
                     erp_data = ""
                     if is_product_query(msg_content):
                         # Extract product keywords from message
@@ -1286,25 +1360,6 @@ async def callback(request: Request) -> dict:
                         except Exception as e:
                             logger.error(f"PDF download/send error: {e}")
                             await push_message(source_id, "⚠ PDF 產生中，請稍後到 ERP 系統下載。")
-                    # Send quote to customer group
-                    target_group = get_group_by_alias(cust_code)
-                    if target_group and target_group.group_id != source_id:
-                        # Build customer-facing message
-                        cust_lines = [
-                            f"您好，以下是您的報價單 {result['quoteNumber']}：\n",
-                        ]
-                        for item in result.get("items", []):
-                            cust_lines.append(
-                                f"• {item['name']} x{item['quantity']}"
-                                f"  NT${item['unitPrice']:,}"
-                            )
-                        cust_lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
-                        if quote_db_id:
-                            dl = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
-                            cust_lines.append(f"\n📄 報價單下載：{dl}")
-                        cust_lines.append("\n如有任何問題請隨時告知，謝謝！")
-                        await push_message(target_group.group_id, "\n".join(cust_lines))
-
                     # Notify admin group
                     if admin_group and source_id != admin_group:
                         await push_message(
