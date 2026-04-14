@@ -1238,9 +1238,8 @@ async def callback(request: Request) -> dict:
                         try:
                             pdf_bytes = erp_download_pdf(quote_db_id)
                             if pdf_bytes:
-                                pdf_id = result["quoteNumber"]
-                                pdf_cache[pdf_id] = pdf_bytes
-                                download_url = f"https://web-production-87474.up.railway.app/pdf/{pdf_id}"
+                                pdf_cache[quote_db_id] = pdf_bytes
+                                download_url = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
                                 await push_message(
                                     source_id,
                                     f"📄 報價單 PDF 下載連結：\n{download_url}"
@@ -1437,14 +1436,18 @@ async def callback(request: Request) -> dict:
     return {"status": "ok"}
 
 
-@app.get("/pdf/{pdf_id}")
-async def download_pdf(pdf_id: str):
+@app.get("/pdf/{quote_id}")
+async def download_pdf(quote_id: str):
     from fastapi.responses import Response
-    pdf_bytes = pdf_cache.get(pdf_id)
+    # Try from cache first
+    pdf_bytes = pdf_cache.get(quote_id)
     if not pdf_bytes:
-        raise HTTPException(status_code=404, detail="PDF not found or expired")
+        # Download from ERP on-the-fly
+        pdf_bytes = erp_download_pdf(quote_id)
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail="PDF not found")
     return Response(content=pdf_bytes, media_type="application/pdf", headers={
-        "Content-Disposition": f"inline; filename={pdf_id}.pdf"
+        "Content-Disposition": f"inline; filename={quote_id}.pdf"
     })
 
 
