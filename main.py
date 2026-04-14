@@ -1354,22 +1354,23 @@ async def callback(request: Request) -> dict:
                     assistant_reply = "系統暫時無法回應，請稍後再試。"
                 await reply_message(reply_token, assistant_reply)
 
-                # Commitment extraction
-                user_name = await get_user_name(user_id)
-                extraction = extract_commitments(user_text, user_name)
-                if extraction and extraction.get("is_commitment"):
-                    items = extraction.get("items", [])
-                    items_text = "、".join(i["content"] for i in items)
-                    save_commitments(
-                        extraction, source_type, source_id, user_id, user_name,
-                        source_name="私訊",
-                    )
-                    await push_message(user_id, f"已記錄待辦：{items_text}")
-                    if admin_group:
-                        await push_message(
-                            admin_group,
-                            f"[私訊] {user_name} 新增待辦：{items_text}",
+                # Commitment extraction (skip product/price queries)
+                if not is_product_query(user_text):
+                    user_name = await get_user_name(user_id)
+                    extraction = extract_commitments(user_text, user_name)
+                    if extraction and extraction.get("is_commitment"):
+                        items = extraction.get("items", [])
+                        items_text = "、".join(i["content"] for i in items)
+                        save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name="私訊",
                         )
+                        await push_message(user_id, f"已記錄待辦：{items_text}")
+                        if admin_group:
+                            await push_message(
+                                admin_group,
+                                f"[私訊] {user_name} 新增待辦：{items_text}",
+                            )
 
             # --- Group chat ---
             elif source_type in ("group", "room"):
