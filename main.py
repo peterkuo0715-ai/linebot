@@ -688,8 +688,15 @@ async def callback(request: Request) -> dict:
                     msg_content = gm.group(2).strip()
                     target = get_group_by_alias(target_alias)
                     if target:
-                        await push_message(target.group_id, msg_content)
-                        await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]")
+                        polished = call_llm([
+                            {"role": "system", "content": (
+                                "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
+                                "保留原意，不要加入原文沒有的資訊。使用繁體中文。簡潔即可，不要太長。"
+                            )},
+                            {"role": "user", "content": msg_content},
+                        ], max_tokens=256)
+                        await push_message(target.group_id, polished)
+                        await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]：\n{polished}")
                     else:
                         await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
                     continue
