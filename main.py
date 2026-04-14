@@ -1083,13 +1083,25 @@ async def callback(request: Request) -> dict:
             if pq:
                 query_text = pq.group(1).strip()
                 staff_user = is_staff(user_id)
-                can_see_customer_price = staff_user and (is_admin_group or False)
-                if not can_see_customer_price and staff_user and SessionLocal:
+                # Parse to check if query contains a customer code
+                parsed_pq = parse_product_query(query_text)
+                explicit_customer = parsed_pq.get("customer_code")
+
+                if staff_user:
+                    # Staff can see any customer price
+                    can_see_customer_price = True
+                elif explicit_customer:
+                    # Non-staff trying to query another customer's price → block
+                    can_see_customer_price = False
+                elif SessionLocal:
+                    # Non-staff in a bound group → can see own group's price
                     db = SessionLocal()
                     try:
                         can_see_customer_price = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
                     finally:
                         db.close()
+                else:
+                    can_see_customer_price = False
                 erp_context = build_erp_context(query_text, source_id, allow_customer_pricing=can_see_customer_price)
                 if erp_context:
                     system_msg = SYSTEM_PROMPT + erp_context + "\n請根據以上資料整理成清楚的報價回覆。"
