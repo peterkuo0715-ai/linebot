@@ -492,20 +492,23 @@ def build_erp_context(question: str, group_source_id: str | None = None,
 
 
 def erp_search_with_fallback(keyword: str) -> list | None:
-    """Search ERP with fallback: try original, then with hyphen, then without."""
-    results = erp_query("products", search=keyword)
-    if results and isinstance(results, list) and len(results) > 0:
-        return results
-    # Try adding hyphen: U7PRO → U7-PRO
-    normalized = re.sub(r"([A-Za-z])(\d)", r"\1-\2", keyword)
-    if normalized != keyword:
-        results = erp_query("products", search=normalized)
-        if results and isinstance(results, list) and len(results) > 0:
-            return results
-    # Try removing hyphen
-    no_hyphen = keyword.replace("-", "")
-    if no_hyphen != keyword:
-        results = erp_query("products", search=no_hyphen)
+    """Search ERP with fallback: try multiple formats."""
+    variations = [
+        keyword,                                          # U7-Pro (original)
+        keyword.replace(" ", "-"),                         # U7 PRO → U7-PRO
+        keyword.replace(" ", ""),                           # U7 PRO → U7PRO
+        keyword.replace("-", " "),                          # U7-Pro → U7 Pro
+        keyword.replace("-", ""),                           # U7-Pro → U7Pro
+        re.sub(r"([A-Za-z])(\d)", r"\1-\2", keyword),      # U7PRO → U7-PRO
+        re.sub(r"(\d)([A-Za-z])", r"\1-\2", keyword.replace(" ", "")),  # U7 PRO → U7-PRO
+    ]
+    seen = set()
+    for v in variations:
+        v = v.strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        results = erp_query("products", search=v)
         if results and isinstance(results, list) and len(results) > 0:
             return results
     return None
