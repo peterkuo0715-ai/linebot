@@ -993,8 +993,18 @@ async def callback(request: Request) -> dict:
             if source_type == "user":
                 try:
                     erp_context = ""
-                    if is_product_query(user_text):
-                        erp_context = build_erp_context(user_text, allow_customer_pricing=False)
+                    # Check current message and recent history for product context
+                    recent_texts = [user_text]
+                    for msg in conversation_history.get(user_id, [])[-4:]:
+                        if msg.get("role") in ("user", "assistant"):
+                            recent_texts.append(msg.get("content", ""))
+                    if any(is_product_query(t) for t in recent_texts):
+                        # Find the best keyword from recent messages
+                        for t in recent_texts:
+                            if is_product_query(t):
+                                erp_context = build_erp_context(t, allow_customer_pricing=False)
+                                if "[ERP 系統查無" not in erp_context:
+                                    break
                     system_msg = SYSTEM_PROMPT + erp_context
                     history = conversation_history[user_id]
                     history.append({"role": "user", "content": user_text})
