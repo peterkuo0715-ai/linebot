@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+ERP_API_URL = os.environ.get("ERP_API_URL", "https://unifi-erp.vercel.app/api/external/linebot")
+ERP_API_TOKEN = os.environ.get("ERP_API_TOKEN", "")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if DATABASE_URL.startswith("postgres://"):
@@ -365,6 +367,59 @@ def extract_commitments(message_text: str, user_name: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# ERP API
+# ---------------------------------------------------------------------------
+
+
+def erp_query(action: str, **params) -> dict | list | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{ERP_API_URL}?action={action}&{qs}"
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(
+                url,
+                headers={"Authorization": f"Bearer {ERP_API_TOKEN}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP query failed: {e}")
+    return None
+
+
+def erp_search_products(keyword: str) -> str:
+    results = erp_query("products", search=keyword)
+    if not results or isinstance(results, dict) and "error" in results:
+        return f"找不到與「{keyword}」相關的商品。"
+    items = results[:10]  # max 10
+    lines = [f"搜尋「{keyword}」找到 {len(results)} 項商品：\n"]
+    for p in items:
+        price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
+        stock = p.get("availability", "")
+        lines.append(f"• {p['sku']} — {p['name']}  建議售價 {price}  {stock}")
+    if len(results) > 10:
+        lines.append(f"\n...還有 {len(results) - 10} 項，請用更精確的關鍵字搜尋")
+    return "\n".join(lines)
+
+
+def erp_get_quote(customer_code: str, sku: str) -> str:
+    result = erp_query("quote", code=customer_code, sku=sku)
+    if not result or isinstance(result, dict) and "error" in result:
+        err = result.get("error", "") if isinstance(result, dict) else ""
+        return f"無法查詢報價：{err}" if err else "無法查詢報價"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def erp_get_customer(customer_code: str) -> dict | None:
+    result = erp_query("customer", code=customer_code)
+    if isinstance(result, dict) and "error" not in result:
+        return result
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
 
@@ -412,6 +467,7 @@ COMPLETE_RE = re.compile(r"^完成\s*#?(\d+)$")
 DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 GROUP_MSG_RE = re.compile(r"^([A-Za-z]\d+)\s+(.+)$", re.DOTALL)
+SEARCH_RE = re.compile(r"^查價\s+(.+)$")
 
 
 def cmd_report_all() -> str:
@@ -701,6 +757,12 @@ async def callback(request: Request) -> dict:
                         await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
                     continue
 
+            # --- Product search command ---
+            sm = SEARCH_RE.match(user_text)
+            if sm:
+                await reply_message(reply_token, erp_search_products(sm.group(1).strip()))
+                continue
+
             # --- Commands (admin group sees all, others see own) ---
             if user_text in ("報告", "待辦清單"):
                 if is_admin_group:
@@ -754,14 +816,43 @@ async def callback(request: Request) -> dict:
                 user_name = await get_user_name(user_id, group_id)
                 group_name = await get_group_name(source_id) if source_type == "group" else "聊天室"
 
-                # 「小幫手」trigger → conversation reply in group
+                # 「小幫手」trigger → conversation reply with ERP context
                 if user_text.startswith(HELPER_TRIGGER):
                     question = user_text[len(HELPER_TRIGGER):].strip()
                     if question:
                         try:
-                            assistant_reply = chat_with_llm(
-                                f"group_{source_id}", question
-                            )
+                            erp_context = ""
+                            products = erp_query("products", search=question)
+                            if products and isinstance(products, list) and len(products) > 0:
+                                plines = []
+                                for p in products[:5]:
+                                    price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
+                                    plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability','')}")
+                                erp_context = "\n\n以下是系統中的商品資料，請根據這些資料回答：\n" + "\n".join(plines)
+
+                            # Check customer-specific pricing
+                            alias_obj = None
+                            if SessionLocal:
+                                db = SessionLocal()
+                                try:
+                                    alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                                finally:
+                                    db.close()
+                            if alias_obj and products and isinstance(products, list):
+                                for p in products[:3]:
+                                    quote = erp_query("quote", code=alias_obj.alias, sku=p["sku"])
+                                    if quote and isinstance(quote, dict) and "error" not in quote:
+                                        erp_context += f"\n此客戶({alias_obj.alias})的 {p['sku']} 專屬報價：{json.dumps(quote, ensure_ascii=False)}"
+
+                            system_msg = SYSTEM_PROMPT + erp_context
+                            history = conversation_history.get(f"group_{source_id}", [])
+                            history.append({"role": "user", "content": question})
+                            if len(history) > MAX_HISTORY:
+                                history = history[-MAX_HISTORY:]
+                            conversation_history[f"group_{source_id}"] = history
+                            msgs = [{"role": "system", "content": system_msg}] + history
+                            assistant_reply = call_llm(msgs)
+                            history.append({"role": "assistant", "content": assistant_reply})
                         except Exception as e:
                             logger.error(f"LLM chat error: {e}")
                             assistant_reply = "系統暫時無法回應，請稍後再試。"
