@@ -841,7 +841,7 @@ async def callback(request: Request) -> dict:
 
         try:
             # --- Help command ---
-            if user_text == "-BOT" or user_text == "-bot":
+            if (user_text == "-BOT" or user_text == "-bot") and is_admin_group:
                 help_lines = [
                     "藍圈科技 Bot 指令一覽：",
                     "",
