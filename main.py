@@ -114,6 +114,13 @@ class GroupAlias(Base):
     group_name = Column(String(128), nullable=True)
 
 
+class Staff(Base):
+    __tablename__ = "staff"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), nullable=False, unique=True)
+    user_name = Column(String(128), nullable=True)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
@@ -275,6 +282,67 @@ def set_setting(key: str, value: str) -> None:
         else:
             db.add(Setting(key=key, value=value))
         db.commit()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Staff helpers
+# ---------------------------------------------------------------------------
+
+
+def register_staff(user_id: str, user_name: str) -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.query(Staff).filter_by(user_id=user_id).first()
+        if existing:
+            existing.user_name = user_name
+        else:
+            db.add(Staff(user_id=user_id, user_name=user_name))
+        db.commit()
+    finally:
+        db.close()
+
+
+def unregister_staff(user_id: str) -> bool:
+    if not SessionLocal:
+        return False
+    db = SessionLocal()
+    try:
+        s = db.query(Staff).filter_by(user_id=user_id).first()
+        if s:
+            db.delete(s)
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def is_staff(user_id: str) -> bool:
+    if not SessionLocal:
+        return False
+    db = SessionLocal()
+    try:
+        return db.query(Staff).filter_by(user_id=user_id).first() is not None
+    finally:
+        db.close()
+
+
+def list_staff() -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    db = SessionLocal()
+    try:
+        members = db.query(Staff).order_by(Staff.user_name).all()
+        if not members:
+            return "尚未註冊任何員工。\n\n員工請私訊 Bot 傳「註冊員工」。"
+        lines = ["員工名冊：\n"]
+        for m in members:
+            lines.append(f"  • {m.user_name}")
+        return "\n".join(lines)
     finally:
         db.close()
 
@@ -868,11 +936,33 @@ async def callback(request: Request) -> dict:
                     "  小幫手 問題 → AI 回覆（群組用）",
                     "  直接打字 → AI 回覆（私訊用）",
                     "",
+                    "【員工管理】",
+                    "  員工名冊 → 查看所有已註冊員工",
+                    "  （員工私訊 Bot「註冊員工」即可註冊）",
+                    "",
                     "【自動功能】",
-                    "  • 群組承諾自動擷取記錄",
+                    "  • 群組承諾自動擷取（區分員工/客戶）",
                     "  • 每天早上 9:00 推播待辦報告",
                 ]
                 await reply_message(reply_token, "\n".join(help_lines))
+                continue
+
+            # --- Staff registration (1:1 only) ---
+            if user_text == "註冊員工" and source_type == "user":
+                uname = await get_user_name(user_id)
+                register_staff(user_id, uname)
+                await reply_message(reply_token, f"已註冊 {uname} 為員工！\n\nBot 在群組中會區分你的訊息為「我方」。")
+                continue
+            if user_text == "取消員工" and source_type == "user":
+                if unregister_staff(user_id):
+                    await reply_message(reply_token, "已取消員工身份。")
+                else:
+                    await reply_message(reply_token, "你尚未註冊為員工。")
+                continue
+
+            # --- Staff list (admin group) ---
+            if user_text == "員工名冊" and is_admin_group:
+                await reply_message(reply_token, list_staff())
                 continue
 
             # --- Admin group setup command ---
@@ -1078,16 +1168,18 @@ async def callback(request: Request) -> dict:
                 if extraction and extraction.get("is_commitment"):
                     items = extraction.get("items", [])
                     items_text = "、".join(i["content"] for i in items)
+                    sender_is_staff = is_staff(user_id)
+                    role_tag = "我方承諾" if sender_is_staff else "客戶要求"
                     save_commitments(
                         extraction, source_type, source_id, user_id, user_name,
                         source_name=group_name,
                     )
                     if not is_admin_group:
-                        await reply_message(reply_token, f"已記錄：{items_text}")
+                        await reply_message(reply_token, f"已記錄（{role_tag}）：{items_text}")
                     if admin_group and not is_admin_group:
                         await push_message(
                             admin_group,
-                            f"[{group_name}] {user_name} 新增待辦：{items_text}",
+                            f"[{group_name}] [{role_tag}] {user_name}：{items_text}",
                         )
 
         except Exception as e:
