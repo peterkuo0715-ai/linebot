@@ -531,13 +531,11 @@ def is_product_query(text: str) -> bool:
 
 
 def build_erp_context(question: str, group_source_id: str | None = None,
-                      allow_customer_pricing: bool = False) -> str:
-    """Query ERP and build context string for LLM.
-
-    allow_customer_pricing: only True for admin group or groups with alias.
-    """
+                      allow_customer_pricing: bool = False,
+                      force_customer_code: str | None = None) -> str:
+    """Query ERP and build context string for LLM."""
     parsed = parse_product_query(question)
-    customer_code = parsed.get("customer_code")
+    customer_code = force_customer_code or parsed.get("customer_code")
     keyword = parsed.get("product_keyword") or question
 
     erp_context = ""
@@ -1442,25 +1440,43 @@ async def callback(request: Request) -> dict:
                 parsed_pq = parse_product_query(query_text)
                 explicit_customer = parsed_pq.get("customer_code")
 
+                # Resolve customer code for pricing
+                resolved_customer = None
+                can_see_customer_price = False
+
                 if staff_user and explicit_customer and is_admin_group:
-                    # Staff in admin group can query any customer price
                     can_see_customer_price = True
-                elif staff_user and not explicit_customer:
-                    # Staff without specifying customer → use group's own price
-                    can_see_customer_price = True
-                elif explicit_customer:
-                    # Non-staff trying to query another customer's price → block
+                    resolved_customer = explicit_customer
+                elif staff_user and explicit_customer and not is_admin_group:
+                    # Staff in non-admin group can't query other customers
                     can_see_customer_price = False
-                elif SessionLocal:
-                    # Non-staff in a bound group → can see own group's price
+                elif staff_user and not explicit_customer:
+                    # Staff without customer code → use group alias
+                    can_see_customer_price = True
+                    if SessionLocal:
+                        db = SessionLocal()
+                        try:
+                            alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                            if alias_obj:
+                                resolved_customer = alias_obj.alias
+                        finally:
+                            db.close()
+                elif not staff_user and not explicit_customer and SessionLocal:
+                    # Non-staff in bound group → own price
                     db = SessionLocal()
                     try:
-                        can_see_customer_price = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
+                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                        if alias_obj:
+                            can_see_customer_price = True
+                            resolved_customer = alias_obj.alias
                     finally:
                         db.close()
-                else:
-                    can_see_customer_price = False
-                erp_context = build_erp_context(query_text, source_id, allow_customer_pricing=can_see_customer_price)
+
+                erp_context = build_erp_context(
+                    query_text, source_id,
+                    allow_customer_pricing=can_see_customer_price,
+                    force_customer_code=resolved_customer,
+                )
                 if erp_context:
                     system_msg = SYSTEM_PROMPT + erp_context + "\n請根據以上資料整理成清楚的報價回覆。"
                     assistant_reply = call_llm(
