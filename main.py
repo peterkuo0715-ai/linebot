@@ -554,8 +554,8 @@ def save_commitments(
 COMPLETE_RE = re.compile(r"^完成\s*#?(\d+)$")
 DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
-GROUP_MSG_RE = re.compile(r"^([A-Za-z]\d+)\s+(.+)$", re.DOTALL)
-SEARCH_RE = re.compile(r"^查價\s+(.+)$")
+REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
+PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
 
 
 def cmd_report_all() -> str:
@@ -824,31 +824,47 @@ async def callback(request: Request) -> dict:
                 await reply_message(reply_token, list_group_aliases())
                 continue
 
-            # --- Remote message from admin group: G10 message ---
-            if is_admin_group:
-                gm = GROUP_MSG_RE.match(user_text)
-                if gm:
-                    target_alias = gm.group(1).upper()
-                    msg_content = gm.group(2).strip()
-                    target = get_group_by_alias(target_alias)
-                    if target:
-                        polished = call_llm([
-                            {"role": "system", "content": (
-                                "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
-                                "保留原意，不要加入原文沒有的資訊。使用繁體中文。簡潔即可，不要太長。"
-                            )},
-                            {"role": "user", "content": msg_content},
-                        ], max_tokens=256)
-                        await push_message(target.group_id, polished)
-                        await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]：\n{polished}")
-                    else:
-                        await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
-                    continue
+            # --- @K01 message → Remote message (LLM polished) ---
+            rm = REMOTE_MSG_RE.match(user_text)
+            if rm and is_admin_group:
+                target_alias = rm.group(1).upper()
+                msg_content = rm.group(2).strip()
+                target = get_group_by_alias(target_alias)
+                if target:
+                    polished = call_llm([
+                        {"role": "system", "content": (
+                            "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
+                            "保留原意，不要加入原文沒有的資訊。使用繁體中文。簡潔即可，不要太長。"
+                        )},
+                        {"role": "user", "content": msg_content},
+                    ], max_tokens=256)
+                    await push_message(target.group_id, polished)
+                    await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]：\n{polished}")
+                else:
+                    await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
+                continue
 
-            # --- Product search command ---
-            sm = SEARCH_RE.match(user_text)
-            if sm:
-                await reply_message(reply_token, erp_search_products(sm.group(1).strip()))
+            # --- $query → Price query ---
+            pq = PRICE_QUERY_RE.match(user_text)
+            if pq:
+                query_text = pq.group(1).strip()
+                can_see_customer_price = is_admin_group
+                if not can_see_customer_price and SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        can_see_customer_price = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
+                    finally:
+                        db.close()
+                erp_context = build_erp_context(query_text, source_id, allow_customer_pricing=can_see_customer_price)
+                if erp_context:
+                    system_msg = SYSTEM_PROMPT + erp_context + "\n請根據以上資料整理成清楚的報價回覆。"
+                    assistant_reply = call_llm(
+                        [{"role": "system", "content": system_msg},
+                         {"role": "user", "content": query_text}],
+                    )
+                else:
+                    assistant_reply = f"找不到與「{query_text}」相關的商品。"
+                await reply_message(reply_token, assistant_reply)
                 continue
 
             # --- Commands (admin group sees all, others see own) ---
@@ -944,20 +960,6 @@ async def callback(request: Request) -> dict:
                             logger.error(f"LLM chat error: {e}")
                             assistant_reply = "系統暫時無法回應，請稍後再試。"
                         await reply_message(reply_token, assistant_reply)
-                    continue
-
-                # Admin group: auto-reply to product queries without prefix
-                if is_admin_group and is_product_query(user_text):
-                    try:
-                        erp_context = build_erp_context(user_text, source_id, allow_customer_pricing=True)
-                        system_msg = SYSTEM_PROMPT + erp_context
-                        msgs = [{"role": "system", "content": system_msg},
-                                {"role": "user", "content": user_text}]
-                        assistant_reply = call_llm(msgs)
-                    except Exception as e:
-                        logger.error(f"Admin ERP query error: {e}")
-                        assistant_reply = "查詢失敗，請稍後再試。"
-                    await reply_message(reply_token, assistant_reply)
                     continue
 
                 # Commitment extraction (silent monitoring)
