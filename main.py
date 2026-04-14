@@ -518,24 +518,24 @@ async def callback(request: Request) -> dict:
             user_name = await get_user_name(user_id)
             extraction = extract_commitments(user_text, user_name)
             if extraction and extraction.get("is_commitment"):
-                saved = save_commitments(
+                items = extraction.get("items", [])
+                items_text = "、".join(i["content"] for i in items)
+                save_commitments(
                     extraction, source_type, source_id, user_id, user_name
                 )
-                if saved:
-                    items_text = "、".join(c.content for c in saved)
-                    await push_message(user_id, f"已記錄待辦：{items_text}")
+                await push_message(user_id, f"已記錄待辦：{items_text}")
 
         # --- Group chat: commitment extraction only ---
         elif source_type in ("group", "room"):
             user_name = await get_user_name(user_id, group_id)
             extraction = extract_commitments(user_text, user_name)
             if extraction and extraction.get("is_commitment"):
-                saved = save_commitments(
+                items = extraction.get("items", [])
+                items_text = "、".join(i["content"] for i in items)
+                save_commitments(
                     extraction, source_type, source_id, user_id, user_name
                 )
-                if saved:
-                    items_text = "、".join(c.content for c in saved)
-                    await reply_message(reply_token, f"已記錄：{items_text}")
+                await reply_message(reply_token, f"已記錄：{items_text}")
 
     return {"status": "ok"}
 
