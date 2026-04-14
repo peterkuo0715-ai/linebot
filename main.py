@@ -877,11 +877,18 @@ async def callback(request: Request) -> dict:
                 msg_content = rm.group(2).strip()
                 target = get_group_by_alias(target_alias)
                 if target:
+                    # Query ERP if message is about products/pricing
+                    erp_data = ""
+                    if is_product_query(msg_content):
+                        erp_data = build_erp_context(msg_content, target.group_id, allow_customer_pricing=True)
+                    system_prompt = (
+                        "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
+                        "使用繁體中文。簡潔即可，不要太長。"
+                    )
+                    if erp_data:
+                        system_prompt += f"\n\n以下是 ERP 系統的資料，請將實際價格帶入訊息中：{erp_data}"
                     polished = call_llm([
-                        {"role": "system", "content": (
-                            "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
-                            "保留原意，不要加入原文沒有的資訊。使用繁體中文。簡潔即可，不要太長。"
-                        )},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": msg_content},
                     ], max_tokens=256)
                     await push_message(target.group_id, polished)
