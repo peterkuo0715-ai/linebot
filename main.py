@@ -88,6 +88,14 @@ class Commitment(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class GroupAlias(Base):
+    __tablename__ = "group_aliases"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    alias = Column(String(32), nullable=False, unique=True)
+    group_id = Column(String(64), nullable=False)
+    group_name = Column(String(128), nullable=True)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
@@ -254,6 +262,53 @@ def set_setting(key: str, value: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Group alias helpers
+# ---------------------------------------------------------------------------
+
+
+def set_group_alias(alias: str, group_id: str, group_name: str) -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+        if existing:
+            existing.group_id = group_id
+            existing.group_name = group_name
+        else:
+            db.add(GroupAlias(alias=alias.upper(), group_id=group_id, group_name=group_name))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_group_by_alias(alias: str) -> GroupAlias | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        return db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+    finally:
+        db.close()
+
+
+def list_group_aliases() -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    db = SessionLocal()
+    try:
+        aliases = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        if not aliases:
+            return "尚未綁定任何群組編號。\n\n到各群組傳「綁定 G10」即可綁定。"
+        lines = ["群組列表：\n"]
+        for a in aliases:
+            lines.append(f"  {a.alias} → {a.group_name}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
 
@@ -355,6 +410,8 @@ def save_commitments(
 # ---------------------------------------------------------------------------
 COMPLETE_RE = re.compile(r"^完成\s*#?(\d+)$")
 DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
+BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
+GROUP_MSG_RE = re.compile(r"^([A-Za-z]\d+)\s+(.+)$", re.DOTALL)
 
 
 def cmd_report_all() -> str:
@@ -601,99 +658,132 @@ async def callback(request: Request) -> dict:
         reply_token = event["replyToken"]
         is_admin_group = admin_group and source_id == admin_group
 
-        # --- Admin group setup command ---
-        if user_text == "設定為管理群組" and source_type == "group":
-            set_setting("admin_group_id", source_id)
-            await reply_message(reply_token, "已設定此群組為管理群組！\n\n所有群組的承諾記錄和每日報告都會發送到這裡。\n\n可用指令：\n• 報告 — 所有待辦\n• 本週報告 — 本週到期\n• 完成 #N — 標記完成\n• 刪除 #N — 刪除事項")
-            continue
-
-        # --- Commands (admin group sees all, others see own) ---
-        if user_text in ("報告", "待辦清單"):
-            if is_admin_group:
-                await reply_message(reply_token, cmd_report_all())
-            else:
-                await reply_message(reply_token, cmd_report(source_id))
-            continue
-        if user_text == "本週報告":
-            if is_admin_group:
-                await reply_message(reply_token, cmd_weekly_report_all())
-            else:
-                await reply_message(reply_token, cmd_weekly_report(source_id))
-            continue
-        m = COMPLETE_RE.match(user_text)
-        if m:
-            await reply_message(reply_token, cmd_complete(int(m.group(1))))
-            continue
-        m = DELETE_RE.match(user_text)
-        if m:
-            await reply_message(reply_token, cmd_delete(int(m.group(1))))
-            continue
-
-        # --- 1:1 chat: conversation + commitment extraction ---
-        if source_type == "user":
-            # Check if starts with 小幫手 (for consistency, also works in 1:1)
-            try:
-                assistant_reply = chat_with_llm(user_id, user_text)
-            except Exception as e:
-                logger.error(f"LLM chat error: {e}")
-                assistant_reply = "系統暫時無法回應，請稍後再試。"
-            await reply_message(reply_token, assistant_reply)
-
-            # Commitment extraction
-            user_name = await get_user_name(user_id)
-            extraction = extract_commitments(user_text, user_name)
-            if extraction and extraction.get("is_commitment"):
-                items = extraction.get("items", [])
-                items_text = "、".join(i["content"] for i in items)
-                save_commitments(
-                    extraction, source_type, source_id, user_id, user_name,
-                    source_name="私訊",
-                )
-                await push_message(user_id, f"已記錄待辦：{items_text}")
-                # Forward to admin group
-                if admin_group:
-                    await push_message(
-                        admin_group,
-                        f"[私訊] {user_name} 新增待辦：{items_text}",
-                    )
-
-        # --- Group chat ---
-        elif source_type in ("group", "room"):
-            user_name = await get_user_name(user_id, group_id)
-            group_name = await get_group_name(source_id) if source_type == "group" else "聊天室"
-
-            # 「小幫手」trigger → conversation reply in group
-            if user_text.startswith(HELPER_TRIGGER):
-                question = user_text[len(HELPER_TRIGGER):].strip()
-                if question:
-                    try:
-                        assistant_reply = chat_with_llm(
-                            f"group_{source_id}", question
-                        )
-                    except Exception as e:
-                        logger.error(f"LLM chat error: {e}")
-                        assistant_reply = "系統暫時無法回應，請稍後再試。"
-                    await reply_message(reply_token, assistant_reply)
+        try:
+            # --- Admin group setup command ---
+            if user_text == "設定為管理群組" and source_type == "group":
+                set_setting("admin_group_id", source_id)
+                await reply_message(reply_token, "已設定此群組為管理群組！\n\n所有群組的承諾記錄和每日報告都會發送到這裡。\n\n可用指令：\n• 報告 — 所有待辦\n• 本週報告 — 本週到期\n• 完成 #N — 標記完成\n• 刪除 #N — 刪除事項\n• 群組列表 — 查看所有綁定群組\n• G10 訊息內容 — 發話到指定群組")
                 continue
 
-            # Commitment extraction (silent monitoring)
-            extraction = extract_commitments(user_text, user_name)
-            if extraction and extraction.get("is_commitment"):
-                items = extraction.get("items", [])
-                items_text = "、".join(i["content"] for i in items)
-                save_commitments(
-                    extraction, source_type, source_id, user_id, user_name,
-                    source_name=group_name,
-                )
-                # Reply in the group
-                if not is_admin_group:
-                    await reply_message(reply_token, f"已記錄：{items_text}")
-                # Forward to admin group
-                if admin_group and not is_admin_group:
-                    await push_message(
-                        admin_group,
-                        f"[{group_name}] {user_name} 新增待辦：{items_text}",
+            # --- Bind group alias (in any group) ---
+            bm = BIND_RE.match(user_text)
+            if bm and source_type == "group":
+                alias = bm.group(1).upper()
+                custom_name = bm.group(2)
+                gname = custom_name if custom_name else await get_group_name(source_id)
+                set_group_alias(alias, source_id, gname)
+                await reply_message(reply_token, f"已綁定此群組為 {alias}（{gname}）")
+                continue
+
+            # --- Group list command ---
+            if user_text == "群組列表":
+                await reply_message(reply_token, list_group_aliases())
+                continue
+
+            # --- Remote message from admin group: G10 message ---
+            if is_admin_group:
+                gm = GROUP_MSG_RE.match(user_text)
+                if gm:
+                    target_alias = gm.group(1).upper()
+                    msg_content = gm.group(2).strip()
+                    target = get_group_by_alias(target_alias)
+                    if target:
+                        await push_message(target.group_id, msg_content)
+                        await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]")
+                    else:
+                        await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
+                    continue
+
+            # --- Commands (admin group sees all, others see own) ---
+            if user_text in ("報告", "待辦清單"):
+                if is_admin_group:
+                    await reply_message(reply_token, cmd_report_all())
+                else:
+                    await reply_message(reply_token, cmd_report(source_id))
+                continue
+            if user_text == "本週報告":
+                if is_admin_group:
+                    await reply_message(reply_token, cmd_weekly_report_all())
+                else:
+                    await reply_message(reply_token, cmd_weekly_report(source_id))
+                continue
+            m = COMPLETE_RE.match(user_text)
+            if m:
+                await reply_message(reply_token, cmd_complete(int(m.group(1))))
+                continue
+            m = DELETE_RE.match(user_text)
+            if m:
+                await reply_message(reply_token, cmd_delete(int(m.group(1))))
+                continue
+
+            # --- 1:1 chat: conversation + commitment extraction ---
+            if source_type == "user":
+                try:
+                    assistant_reply = chat_with_llm(user_id, user_text)
+                except Exception as e:
+                    logger.error(f"LLM chat error: {e}")
+                    assistant_reply = "系統暫時無法回應，請稍後再試。"
+                await reply_message(reply_token, assistant_reply)
+
+                # Commitment extraction
+                user_name = await get_user_name(user_id)
+                extraction = extract_commitments(user_text, user_name)
+                if extraction and extraction.get("is_commitment"):
+                    items = extraction.get("items", [])
+                    items_text = "、".join(i["content"] for i in items)
+                    save_commitments(
+                        extraction, source_type, source_id, user_id, user_name,
+                        source_name="私訊",
                     )
+                    await push_message(user_id, f"已記錄待辦：{items_text}")
+                    if admin_group:
+                        await push_message(
+                            admin_group,
+                            f"[私訊] {user_name} 新增待辦：{items_text}",
+                        )
+
+            # --- Group chat ---
+            elif source_type in ("group", "room"):
+                user_name = await get_user_name(user_id, group_id)
+                group_name = await get_group_name(source_id) if source_type == "group" else "聊天室"
+
+                # 「小幫手」trigger → conversation reply in group
+                if user_text.startswith(HELPER_TRIGGER):
+                    question = user_text[len(HELPER_TRIGGER):].strip()
+                    if question:
+                        try:
+                            assistant_reply = chat_with_llm(
+                                f"group_{source_id}", question
+                            )
+                        except Exception as e:
+                            logger.error(f"LLM chat error: {e}")
+                            assistant_reply = "系統暫時無法回應，請稍後再試。"
+                        await reply_message(reply_token, assistant_reply)
+                    continue
+
+                # Commitment extraction (silent monitoring)
+                extraction = extract_commitments(user_text, user_name)
+                if extraction and extraction.get("is_commitment"):
+                    items = extraction.get("items", [])
+                    items_text = "、".join(i["content"] for i in items)
+                    save_commitments(
+                        extraction, source_type, source_id, user_id, user_name,
+                        source_name=group_name,
+                    )
+                    if not is_admin_group:
+                        await reply_message(reply_token, f"已記錄：{items_text}")
+                    if admin_group and not is_admin_group:
+                        await push_message(
+                            admin_group,
+                            f"[{group_name}] {user_name} 新增待辦：{items_text}",
+                        )
+
+        except Exception as e:
+            logger.error(f"Event processing error: {e}")
+            try:
+                await reply_message(reply_token, f"處理訊息時發生錯誤：{type(e).__name__}")
+            except Exception:
+                pass
 
     return {"status": "ok"}
 
