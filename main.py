@@ -489,7 +489,8 @@ def erp_query(action: str, **params) -> dict | list | None:
     if not ERP_API_TOKEN:
         return None
     try:
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        from urllib.parse import quote
+        qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
         url = f"{ERP_API_URL}?action={action}&{qs}"
         with httpx.Client(timeout=15) as client:
             resp = client.get(
@@ -598,6 +599,7 @@ def erp_search_with_fallback(keyword: str) -> list | None:
         keyword.replace("-", ""),                           # U7-Pro → U7Pro
         re.sub(r"([A-Za-z])(\d)", r"\1-\2", keyword),      # U7PRO → U7-PRO
         re.sub(r"(\d)([A-Za-z])", r"\1-\2", keyword.replace(" ", "")),  # U7 PRO → U7-PRO
+        re.sub(r"[+\-*/()（）]", "", keyword),              # U6+ → U6
     ]
     seen = set()
     for v in variations:
