@@ -1438,9 +1438,14 @@ async def callback(request: Request) -> dict:
             if pq:
                 query_text = pq.group(1).strip()
                 staff_user = is_staff(user_id)
-                # Parse to check if query contains a customer code
-                parsed_pq = parse_product_query(query_text)
-                explicit_customer = parsed_pq.get("customer_code")
+                # Check if first word is a customer code (letter + digits, e.g. K01)
+                # Don't use LLM — regex is reliable
+                cust_match = re.match(r"^([A-Za-z]\d{1,4})\s+(.+)$", query_text)
+                if cust_match:
+                    explicit_customer = cust_match.group(1).upper()
+                    query_text = cust_match.group(2).strip()
+                else:
+                    explicit_customer = None
 
                 # Resolve customer code for pricing
                 resolved_customer = None
