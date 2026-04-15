@@ -901,8 +901,8 @@ REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
 QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)
-REMIND_RE = re.compile(r"^提醒\s+(\d{1,2}/\d{1,2})\s+(.+)$")
-FOLLOW_RE = re.compile(r"^催\s+(.+?)\s+每(\d+)小時\s*催?(\d+)次$")
+REMIND_RE = re.compile(r"^提醒\s*(\d{1,2}/\d{1,2})\s*(.+)$")
+FOLLOW_RE = re.compile(r"^催\s*(.+?)\s*每(\d+)小時\s*催?(\d+)次$")
 TRACK_REPLY_RE = re.compile(r"^#(\d+)-([123])$")
 CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")  # 沒指定客戶代號
 
