@@ -124,6 +124,23 @@ class Staff(Base):
     role = Column(String(32), nullable=True)
 
 
+class Reminder(Base):
+    __tablename__ = "reminders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_group_id = Column(String(64), nullable=False)
+    target_alias = Column(String(32), nullable=True)
+    content = Column(Text, nullable=False)
+    scheduled_date = Column(Date, nullable=True)
+    interval_hours = Column(Integer, nullable=True)
+    max_count = Column(Integer, default=1)
+    sent_count = Column(Integer, default=0)
+    next_send_at = Column(DateTime, nullable=True)
+    status = Column(String(16), default="active")
+    reply_type = Column(String(16), nullable=True)
+    created_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
@@ -169,6 +186,9 @@ def migrate_db():
                 conn.execute(text("ALTER TABLE staff ADD COLUMN role VARCHAR(32)"))
                 logger.info("Added role column to staff")
             conn.commit()
+    if "reminders" not in insp.get_table_names():
+        Base.metadata.tables["reminders"].create(engine)
+        logger.info("Created reminders table")
 
 
 @asynccontextmanager
@@ -181,6 +201,12 @@ async def lifespan(app: FastAPI):
         daily_report_job,
         CronTrigger(hour=9, minute=0, timezone="Asia/Taipei"),
         id="daily_report",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        reminder_job,
+        CronTrigger(minute=0, timezone="Asia/Taipei"),
+        id="reminder_check",
         replace_existing=True,
     )
     scheduler.start()
@@ -482,6 +508,122 @@ def extract_commitments(message_text: str, user_name: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Reminder helpers
+# ---------------------------------------------------------------------------
+
+
+def create_reminder(
+    target_group_id: str, target_alias: str, content: str,
+    created_by: str, scheduled_date: date | None = None,
+    interval_hours: int | None = None, max_count: int = 1,
+) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        if scheduled_date:
+            # Schedule for 9:00 AM on that date
+            next_send = datetime.combine(scheduled_date, datetime.min.time().replace(hour=9))
+            if next_send <= now:
+                next_send = now  # If date is today/past, send immediately
+        elif interval_hours:
+            next_send = now  # Send first one immediately
+        else:
+            next_send = now
+
+        r = Reminder(
+            target_group_id=target_group_id,
+            target_alias=target_alias,
+            content=content,
+            scheduled_date=scheduled_date,
+            interval_hours=interval_hours,
+            max_count=max_count,
+            sent_count=0,
+            next_send_at=next_send,
+            status="active",
+            created_by=created_by,
+        )
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+def get_active_reminders_for_group(group_id: str) -> list[Reminder]:
+    if not SessionLocal:
+        return []
+    db = SessionLocal()
+    try:
+        return db.query(Reminder).filter_by(
+            target_group_id=group_id, status="active"
+        ).order_by(Reminder.created_at).all()
+    finally:
+        db.close()
+
+
+def get_all_active_reminders() -> list[Reminder]:
+    if not SessionLocal:
+        return []
+    db = SessionLocal()
+    try:
+        return db.query(Reminder).filter_by(status="active").order_by(Reminder.next_send_at).all()
+    finally:
+        db.close()
+
+
+def update_reminder_status(reminder_id: int, status: str, reply_type: str | None = None) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        r = db.query(Reminder).filter_by(id=reminder_id).first()
+        if r:
+            r.status = status
+            if reply_type:
+                r.reply_type = reply_type
+            db.commit()
+            db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+def update_reminder_reschedule(reminder_id: int, new_date: date) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        r = db.query(Reminder).filter_by(id=reminder_id).first()
+        if r:
+            r.scheduled_date = new_date
+            r.next_send_at = datetime.combine(new_date, datetime.min.time().replace(hour=9))
+            r.sent_count = 0
+            r.status = "active"
+            db.commit()
+            db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+async def send_reminder_message(reminder: Reminder) -> None:
+    """Send reminder with numbered options to target group."""
+    lines = [
+        f"[#{reminder.id}] 提醒：{reminder.content}",
+        "",
+        f"  #{reminder.id}-1 收到",
+        f"  #{reminder.id}-2 已完成",
+        f"  #{reminder.id}-3 改時間",
+    ]
+    if reminder.sent_count > 0:
+        lines[0] = f"[#{reminder.id}] 再次提醒（第 {reminder.sent_count + 1} 次）：{reminder.content}"
+    await push_message(reminder.target_group_id, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # ERP API
 # ---------------------------------------------------------------------------
 
@@ -758,7 +900,11 @@ BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
 QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
-QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)  # 沒指定客戶代號
+QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)
+REMIND_RE = re.compile(r"^提醒\s+(\d{1,2}/\d{1,2})\s+(.+)$")
+FOLLOW_RE = re.compile(r"^催\s+(.+?)\s+每(\d+)小時\s*催?(\d+)次$")
+TRACK_REPLY_RE = re.compile(r"^#(\d+)-([123])$")
+CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")  # 沒指定客戶代號
 
 
 def cmd_report_all() -> str:
@@ -915,6 +1061,48 @@ def cmd_delete(item_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def reminder_job():
+    """Check and send due reminders every hour."""
+    if not SessionLocal:
+        return
+    admin_group = get_setting("admin_group_id")
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        due = db.query(Reminder).filter(
+            Reminder.status == "active",
+            Reminder.next_send_at <= now,
+        ).all()
+
+        for r in due:
+            try:
+                await send_reminder_message(r)
+                r.sent_count += 1
+                # Calculate next send time
+                if r.interval_hours and r.sent_count < r.max_count:
+                    r.next_send_at = now + timedelta(hours=r.interval_hours)
+                else:
+                    if r.sent_count >= r.max_count:
+                        r.status = "expired"
+                        if admin_group:
+                            alias = f"[{r.target_alias}] " if r.target_alias else ""
+                            await push_message(
+                                admin_group,
+                                f"⚠ {alias}追蹤 #{r.id} 已催 {r.sent_count} 次未回覆：{r.content}"
+                            )
+                    else:
+                        r.next_send_at = None  # One-time reminder, done sending
+                        # Don't mark as expired yet, wait for reply
+                r.last_reminded_at = now
+                db.commit()
+            except Exception as e:
+                logger.error(f"Reminder #{r.id} send failed: {e}")
+    except Exception as e:
+        logger.error(f"Reminder job failed: {e}")
+    finally:
+        db.close()
+
+
 async def daily_report_job():
     if not SessionLocal:
         return
@@ -1005,7 +1193,110 @@ async def callback(request: Request) -> dict:
         reply_token = event["replyToken"]
         is_admin_group = admin_group and source_id == admin_group
 
+        # State for reschedule flow
+        reschedule_state: dict = {}
+
         try:
+            # --- Tracking reply: #5-1, #5-2, #5-3 ---
+            tr = TRACK_REPLY_RE.match(user_text)
+            if tr:
+                rid = int(tr.group(1))
+                choice = int(tr.group(2))
+                r = update_reminder_status(
+                    rid,
+                    "confirmed" if choice == 1 else "completed" if choice == 2 else "active",
+                    "收到" if choice == 1 else "已完成" if choice == 2 else "改時間",
+                )
+                if r:
+                    if choice == 1:
+                        await reply_message(reply_token, "好的，已確認收到 ✓")
+                    elif choice == 2:
+                        await reply_message(reply_token, f"已完成 ✓ #{rid} {r.content}")
+                    elif choice == 3:
+                        await reply_message(reply_token, "請問改到什麼時候？（格式：月/日，例如 4/20）")
+                        reschedule_state[source_id] = rid
+                    if admin_group:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        status_text = ["", "收到", "已完成", "改時間"][choice]
+                        await push_message(admin_group, f"{alias}追蹤 #{rid} 回覆：{status_text}")
+                else:
+                    await reply_message(reply_token, f"找不到追蹤 #{rid}")
+                continue
+
+            # --- Text keyword reply: 收到/已完成/改時間 (single active reminder) ---
+            if user_text in ("收到", "已完成", "改時間") and source_type == "group":
+                active = get_active_reminders_for_group(source_id)
+                if len(active) == 1:
+                    r = active[0]
+                    if user_text == "收到":
+                        update_reminder_status(r.id, "confirmed", "收到")
+                        await reply_message(reply_token, "好的，已確認收到 ✓")
+                    elif user_text == "已完成":
+                        update_reminder_status(r.id, "completed", "已完成")
+                        await reply_message(reply_token, f"已完成 ✓ #{r.id} {r.content}")
+                    elif user_text == "改時間":
+                        await reply_message(reply_token, "請問改到什麼時候？（格式：月/日，例如 4/20）")
+                    if admin_group:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        await push_message(admin_group, f"{alias}追蹤 #{r.id} 回覆：{user_text}")
+                    continue
+                elif len(active) > 1:
+                    lines = ["目前有多筆追蹤，請指定編號：\n"]
+                    for a in active:
+                        lines.append(f"  #{a.id}-1 收到（{a.content[:20]}）")
+                    await reply_message(reply_token, "\n".join(lines))
+                    continue
+
+            # --- Reschedule date reply (月/日 format) ---
+            date_match = re.match(r"^(\d{1,2})/(\d{1,2})$", user_text)
+            if date_match and source_type == "group":
+                active = get_active_reminders_for_group(source_id)
+                if active:
+                    month = int(date_match.group(1))
+                    day = int(date_match.group(2))
+                    year = date.today().year
+                    try:
+                        new_date = date(year, month, day)
+                        r = active[0]  # Reschedule the most recent active one
+                        update_reminder_reschedule(r.id, new_date)
+                        await reply_message(reply_token, f"已改期 #{r.id} 到 {new_date}，届時會再提醒您 ✓")
+                        if admin_group:
+                            alias = f"[{r.target_alias}] " if r.target_alias else ""
+                            await push_message(admin_group, f"{alias}追蹤 #{r.id} 改期到 {new_date}")
+                    except ValueError:
+                        await reply_message(reply_token, "日期格式錯誤，請用 月/日（例如 4/20）")
+                    continue
+
+            # --- Tracking dashboard ---
+            if user_text == "追蹤中" and is_staff(user_id):
+                reminders = get_all_active_reminders()
+                if not reminders:
+                    await reply_message(reply_token, "目前沒有進行中的追蹤。")
+                else:
+                    lines = ["進行中的追蹤：\n"]
+                    for r in reminders:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        due = f"排定 {r.scheduled_date}" if r.scheduled_date else ""
+                        interval = f"每 {r.interval_hours}h" if r.interval_hours else ""
+                        count = f"已催 {r.sent_count}/{r.max_count}" if r.max_count > 1 else ""
+                        info = " / ".join(filter(None, [due, interval, count]))
+                        lines.append(f"#{r.id} {alias}{r.content}")
+                        if info:
+                            lines.append(f"     {info}")
+                    await reply_message(reply_token, "\n".join(lines))
+                continue
+
+            # --- Cancel tracking ---
+            ct = CANCEL_TRACK_RE.match(user_text)
+            if ct and is_staff(user_id):
+                rid = int(ct.group(1))
+                r = update_reminder_status(rid, "cancelled")
+                if r:
+                    await reply_message(reply_token, f"已取消追蹤 #{rid}：{r.content}")
+                else:
+                    await reply_message(reply_token, f"找不到追蹤 #{rid}")
+                continue
+
             # --- Help command ---
             if (user_text == "-BOT" or user_text == "-bot") and is_admin_group and is_staff(user_id):
                 help_lines = [
@@ -1027,6 +1318,12 @@ async def callback(request: Request) -> dict:
                     "",
                     "【遠端發話】（員工限定）",
                     "  @K01 訊息內容 → 發送到群組（自動潤飾）",
+                    "",
+                    "【提醒/催促】（員工限定）",
+                    "  @K01 提醒 4/16 寄合約 → 排定提醒",
+                    "  @K01 催 確認時間 每2小時 催3次",
+                    "  追蹤中 → 查看進行中的追蹤",
+                    "  取消追蹤 #5 → 取消",
                     "",
                     "【待辦管理】（員工限定）",
                     "  報告 → 所有群組待辦",
@@ -1174,6 +1471,52 @@ async def callback(request: Request) -> dict:
                 msg_content = rm.group(2).strip()
                 target = get_group_by_alias(target_alias)
                 if target:
+                    # @K01 提醒 4/12 message → schedule reminder
+                    rm_remind = REMIND_RE.match(msg_content)
+                    if rm_remind:
+                        d_str = rm_remind.group(1)
+                        msg = rm_remind.group(2).strip()
+                        month, day = map(int, d_str.split("/"))
+                        year = date.today().year
+                        try:
+                            sched_date = date(year, month, day)
+                        except ValueError:
+                            await reply_message(reply_token, "日期格式錯誤")
+                            continue
+                        r = create_reminder(
+                            target.group_id, target_alias, msg,
+                            user_id, scheduled_date=sched_date,
+                        )
+                        if r:
+                            await reply_message(reply_token, f"已排程 #{r.id}：{sched_date} 提醒 [{target_alias}] {msg}")
+                        continue
+
+                    # @K01 催 message 每2小時 催3次 → periodic follow-up
+                    rm_follow = FOLLOW_RE.match(msg_content)
+                    if rm_follow:
+                        msg = rm_follow.group(1).strip()
+                        hours = int(rm_follow.group(2))
+                        times = int(rm_follow.group(3))
+                        r = create_reminder(
+                            target.group_id, target_alias, msg,
+                            user_id, interval_hours=hours, max_count=times,
+                        )
+                        if r:
+                            # Send first one immediately
+                            await send_reminder_message(r)
+                            if SessionLocal:
+                                db = SessionLocal()
+                                try:
+                                    rem = db.query(Reminder).filter_by(id=r.id).first()
+                                    if rem:
+                                        rem.sent_count = 1
+                                        rem.next_send_at = datetime.now() + timedelta(hours=hours)
+                                        db.commit()
+                                finally:
+                                    db.close()
+                            await reply_message(reply_token, f"已建立催促 #{r.id}：每 {hours} 小時催 [{target_alias}]，共 {times} 次\n第 1 次已發送")
+                        continue
+
                     # @K01 報價 ... → create quote and send to customer group
                     if msg_content.startswith("報價"):
                         quote_items_str = msg_content[2:].strip()
