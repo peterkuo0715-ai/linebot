@@ -933,7 +933,7 @@ def save_commitments(
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
-COMPLETE_RE = re.compile(r"^完成\s*#?(\d+)$")
+COMPLETE_RE = re.compile(r"^(?:完成\s*#?|-)(\d+)$")
 DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
 BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
 REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
