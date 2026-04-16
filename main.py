@@ -943,7 +943,8 @@ QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)
 REMIND_RE = re.compile(r"^提醒\s*(\d{1,2}/\d{1,2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$")
 FOLLOW_RE = re.compile(r"^催\s*(.+?)\s*每(\d+)小時\s*催?(\d+)次$")
 TRACK_REPLY_RE = re.compile(r"^#(\d+)-([123])$")
-CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")  # 沒指定客戶代號
+CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")
+APPROVE_RE = re.compile(r"^#(\d+)-([YNyn])$")  # 沒指定客戶代號
 
 
 def cmd_report_all() -> str:
@@ -1260,6 +1261,39 @@ async def callback(request: Request) -> dict:
                         await push_message(admin_group, f"{alias}追蹤 #{rid} 回覆：{status_text}")
                 else:
                     await reply_message(reply_token, f"找不到追蹤 #{rid}")
+                continue
+
+            # --- Approval: #30-Y / #30-N ---
+            ap = APPROVE_RE.match(user_text)
+            if ap and is_staff(user_id):
+                cid = int(ap.group(1))
+                choice = ap.group(2).upper()
+                if SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        c = db.query(Commitment).filter_by(id=cid).first()
+                        if c and c.status == "pending_approval":
+                            if choice == "Y":
+                                c.status = "pending"
+                                db.commit()
+                                await reply_message(reply_token, f"已接受 → 加入待辦 ✓\n#{c.id} {c.content}")
+                                # Notify customer group
+                                target = get_group_by_alias(c.source_name) if c.source_name else None
+                                if c.source_id and c.source_type == "group":
+                                    await push_message(
+                                        c.source_id,
+                                        "好的，我們會盡快為您處理，謝謝！"
+                                    )
+                            elif choice == "N":
+                                c.status = "rejected"
+                                db.commit()
+                                await reply_message(reply_token, f"已略過 #{c.id}（記錄保留）")
+                        elif c and c.status != "pending_approval":
+                            await reply_message(reply_token, f"#{cid} 已處理過（狀態：{c.status}）")
+                        else:
+                            await reply_message(reply_token, f"找不到 #{cid}")
+                    finally:
+                        db.close()
                 continue
 
             # --- Text keyword reply: 收到/已完成/改時間 (single active reminder) ---
@@ -2022,18 +2056,46 @@ async def callback(request: Request) -> dict:
                     items = extraction.get("items", [])
                     items_text = "、".join(i["content"] for i in items)
                     sender_is_staff = is_staff(user_id)
-                    role_tag = "我方承諾" if sender_is_staff else "客戶要求"
-                    save_commitments(
-                        extraction, source_type, source_id, user_id, user_name,
-                        source_name=group_name,
-                    )
-                    if not is_admin_group:
-                        await reply_message(reply_token, f"已記錄（{role_tag}）：{items_text}")
-                    if admin_group and not is_admin_group:
-                        await push_message(
-                            admin_group,
-                            f"[{group_name}] [{role_tag}] {user_name}：{items_text}",
+
+                    if sender_is_staff:
+                        # 員工承諾 → 直接進待辦
+                        save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name=group_name,
                         )
+                        if not is_admin_group:
+                            await reply_message(reply_token, f"已記錄（我方承諾）：{items_text}")
+                        if admin_group and not is_admin_group:
+                            await push_message(
+                                admin_group,
+                                f"[{group_name}] [我方承諾] {user_name}：{items_text}",
+                            )
+                    else:
+                        # 客戶要求 → 記錄但待審核
+                        saved = save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name=group_name,
+                        )
+                        # 標記為待審核
+                        if saved and SessionLocal:
+                            db = SessionLocal()
+                            try:
+                                for c in saved:
+                                    item = db.query(Commitment).filter_by(id=c.id).first()
+                                    if item:
+                                        item.status = "pending_approval"
+                                db.commit()
+                            finally:
+                                db.close()
+                        # 通知管理群組審核
+                        if admin_group and saved:
+                            for c in saved:
+                                await push_message(
+                                    admin_group,
+                                    f"[{group_name}] 客戶要求：{c.content}\n\n"
+                                    f"  #{c.id}-Y 接受（加入待辦）\n"
+                                    f"  #{c.id}-N 略過（僅記錄）",
+                                )
 
         except Exception as e:
             logger.error(f"Event processing error: {e}")
