@@ -228,6 +228,9 @@ app = FastAPI(lifespan=lifespan)
 conversation_history: dict[str, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 
+# Display number → DB ID mapping (refreshed on each report)
+display_id_map: dict[int, int] = {}
+
 # Registration state: user_id → {"step": "username"|"pin", "username": "..."}
 registration_state: dict[str, dict] = {}
 
@@ -949,6 +952,7 @@ APPROVE_RE = re.compile(r"^#(\d+)-([YNyn])$")  # 沒指定客戶代號
 
 def cmd_report_all() -> str:
     """管理群組用：列出所有群組的待辦"""
+    global display_id_map
     if not SessionLocal:
         return "資料庫未連線，無法查詢。"
     db = SessionLocal()
@@ -960,19 +964,24 @@ def cmd_report_all() -> str:
             .all()
         )
         if not items:
+            display_id_map = {}
             return "目前沒有待辦事項。"
+        display_id_map = {}
         lines = ["全部待辦清單：\n"]
-        for c in items:
+        for i, c in enumerate(items, 1):
+            display_id_map[i] = c.id
             due = f"（截止：{c.due_date}）" if c.due_date else ""
             source = f"[{c.source_name}] " if c.source_name else ""
             assignee = f"{c.user_name}: " if c.user_name else ""
-            lines.append(f"#{c.id} {source}{assignee}{c.content} {due}")
+            lines.append(f"({i}) {source}{assignee}{c.content} {due}")
+        lines.append(f"\n輸入 -N 完成，例如 -1")
         return "\n".join(lines)
     finally:
         db.close()
 
 
 def cmd_report(source_id: str) -> str:
+    global display_id_map
     if not SessionLocal:
         return "資料庫未連線，無法查詢。"
     db = SessionLocal()
@@ -984,12 +993,16 @@ def cmd_report(source_id: str) -> str:
             .all()
         )
         if not items:
+            display_id_map = {}
             return "目前沒有待辦事項。"
+        display_id_map = {}
         lines = ["待辦清單：\n"]
-        for c in items:
+        for i, c in enumerate(items, 1):
+            display_id_map[i] = c.id
             due = f"（截止：{c.due_date}）" if c.due_date else ""
             assignee = f"[{c.user_name}] " if c.user_name else ""
-            lines.append(f"#{c.id} {assignee}{c.content} {due}")
+            lines.append(f"({i}) {assignee}{c.content} {due}")
+        lines.append(f"\n輸入 -N 完成，例如 -1")
         return "\n".join(lines)
     finally:
         db.close()
@@ -1066,17 +1079,23 @@ def cmd_weekly_report(source_id: str) -> str:
         db.close()
 
 
-def cmd_complete(item_id: int) -> str:
+def cmd_complete(item_id: int, use_display: bool = False) -> str:
     if not SessionLocal:
         return "資料庫未連線。"
+    # Resolve display number to DB ID
+    db_id = item_id
+    if use_display and item_id in display_id_map:
+        db_id = display_id_map[item_id]
+    elif use_display:
+        return f"找不到序號 ({item_id})，請先打「報告」查看清單。"
     db = SessionLocal()
     try:
-        c = db.query(Commitment).filter_by(id=item_id, status="pending").first()
+        c = db.query(Commitment).filter_by(id=db_id, status="pending").first()
         if not c:
-            return f"找不到待辦事項 #{item_id}，或該事項已完成/刪除。"
+            return f"找不到待辦事項，或該事項已完成/刪除。"
         c.status = "done"
         db.commit()
-        return f"已完成：#{c.id} {c.content}"
+        return f"已完成：{c.content} ✓"
     finally:
         db.close()
 
@@ -1960,7 +1979,10 @@ async def callback(request: Request) -> dict:
                 continue
             m = COMPLETE_RE.match(user_text)
             if m:
-                await reply_message(reply_token, cmd_complete(int(m.group(1))))
+                num = int(m.group(1))
+                # -N uses display number, 完成 #N uses DB ID
+                is_shortcut = user_text.startswith("-")
+                await reply_message(reply_token, cmd_complete(num, use_display=is_shortcut))
                 continue
             m = DELETE_RE.match(user_text)
             if m:
