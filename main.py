@@ -456,22 +456,56 @@ def list_group_aliases() -> str:
 # ---------------------------------------------------------------------------
 
 
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
 def call_llm(messages: list[dict], max_tokens: int = 1024) -> str:
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
+    if LLM_PROVIDER == "claude" and ANTHROPIC_API_KEY:
+        # Extract system message
+        system_text = ""
+        chat_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text += m["content"] + "\n"
+            else:
+                chat_messages.append(m)
+        with httpx.Client(timeout=60) as client:
+            body = {
+                "model": "claude-sonnet-4-20250514",
                 "max_tokens": max_tokens,
-                "messages": messages,
-            },
-        )
-        resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+                "messages": chat_messages,
+            }
+            if system_text.strip():
+                body["system"] = system_text.strip()
+            resp = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+        return resp.json()["content"][0]["text"]
+    else:
+        # Fallback to Groq
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": max_tokens,
+                    "messages": messages,
+                },
+            )
+            resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 def chat_with_llm(user_id: str, user_message: str) -> str:
