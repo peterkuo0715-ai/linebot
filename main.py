@@ -1951,7 +1951,6 @@ async def callback(request: Request) -> dict:
                             extraction, source_type, source_id, user_id, user_name,
                             source_name="私訊",
                         )
-                        await push_message(user_id, f"已記錄待辦：{items_text}")
                         if admin_group:
                             await push_message(
                                 admin_group,
