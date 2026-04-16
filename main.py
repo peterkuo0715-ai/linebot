@@ -940,7 +940,7 @@ REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
 QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
 QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)
-REMIND_RE = re.compile(r"^提醒\s*(\d{1,2}/\d{1,2})\s*(.+)$")
+REMIND_RE = re.compile(r"^提醒\s*(\d{1,2}/\d{1,2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$")
 FOLLOW_RE = re.compile(r"^催\s*(.+?)\s*每(\d+)小時\s*催?(\d+)次$")
 TRACK_REPLY_RE = re.compile(r"^#(\d+)-([123])$")
 CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")  # 沒指定客戶代號
@@ -1530,7 +1530,8 @@ async def callback(request: Request) -> dict:
                     rm_remind = REMIND_RE.match(msg_content)
                     if rm_remind:
                         d_str = rm_remind.group(1)
-                        msg = rm_remind.group(2).strip()
+                        t_str = rm_remind.group(2)  # optional time "14:30"
+                        msg = rm_remind.group(3).strip()
                         month, day = map(int, d_str.split("/"))
                         year = date.today().year
                         try:
@@ -1538,12 +1539,28 @@ async def callback(request: Request) -> dict:
                         except ValueError:
                             await reply_message(reply_token, "日期格式錯誤")
                             continue
+                        # Parse time or default to 9:00
+                        hour, minute = 9, 0
+                        if t_str:
+                            hour, minute = map(int, t_str.split(":"))
+                        sched_dt = datetime.combine(sched_date, datetime.min.time().replace(hour=hour, minute=minute))
                         r = create_reminder(
                             target.group_id, target_alias, msg,
                             user_id, scheduled_date=sched_date,
                         )
+                        # Override next_send_at with exact time
+                        if r and SessionLocal:
+                            db = SessionLocal()
+                            try:
+                                rem = db.query(Reminder).filter_by(id=r.id).first()
+                                if rem:
+                                    rem.next_send_at = sched_dt
+                                    db.commit()
+                            finally:
+                                db.close()
                         if r:
-                            await reply_message(reply_token, f"已排程 #{r.id}：{sched_date} 提醒 [{target_alias}] {msg}")
+                            time_display = f"{hour:02d}:{minute:02d}"
+                            await reply_message(reply_token, f"已排程 #{r.id}：{sched_date} {time_display} 提醒 [{target_alias}] {msg}")
                         continue
 
                     # @K01 催 message 每2小時 催3次 → periodic follow-up
