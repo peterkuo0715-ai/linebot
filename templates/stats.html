@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% set active = 'stats' %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800">統計圖表</h1>
+    <p class="text-slate-500 mt-1">近 30 天完成率：<span class="font-bold text-green-600">{{ charts.completion_rate }}%</span></p>
+</div>
+
+<div class="grid md:grid-cols-2 gap-4">
+    <div class="glass rounded-2xl p-5">
+        <h3 class="font-semibold text-slate-800 mb-3">待辦狀態分布</h3>
+        <canvas id="statusChart" width="400" height="300"></canvas>
+    </div>
+
+    <div class="glass rounded-2xl p-5">
+        <h3 class="font-semibold text-slate-800 mb-3">近 7 天訊息量</h3>
+        <canvas id="messagesChart" width="400" height="300"></canvas>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<script>
+    const statusCounts = {{ charts.status_counts | tojson }};
+    const labelMap = {pending: '待辦中', done: '已完成', deleted: '已刪除', rejected: '已拒絕', pending_approval: '待審核'};
+    const colorMap = {pending: '#f59e0b', done: '#10b981', deleted: '#ef4444', rejected: '#64748b', pending_approval: '#3b82f6'};
+
+    new Chart(document.getElementById('statusChart'), {
+        type: 'doughnut',
+        data: {
+            labels: Object.keys(statusCounts).map(k => labelMap[k] || k),
+            datasets: [{
+                data: Object.values(statusCounts),
+                backgroundColor: Object.keys(statusCounts).map(k => colorMap[k] || '#888'),
+                borderWidth: 2,
+                borderColor: '#fff',
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: {position: 'bottom'},
+            }
+        }
+    });
+
+    const dailyData = {{ charts.daily_messages | tojson }};
+    new Chart(document.getElementById('messagesChart'), {
+        type: 'bar',
+        data: {
+            labels: dailyData.map(d => d.date.slice(5)),
+            datasets: [{
+                label: '訊息數',
+                data: dailyData.map(d => d.count),
+                backgroundColor: 'rgba(139, 92, 246, 0.6)',
+                borderColor: 'rgba(139, 92, 246, 1)',
+                borderWidth: 2,
+                borderRadius: 8,
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {legend: {display: false}},
+            scales: {y: {beginAtZero: true, ticks: {precision: 0}}}
+        }
+    });
+</script>
+{% endblock %}

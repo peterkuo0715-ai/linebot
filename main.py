@@ -1,30 +1,288 @@
 import os
+import re
+import json
 import hashlib
 import hmac
 import base64
+import logging
 from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
 
-import anthropic
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, Date, DateTime, Boolean, func, and_, or_,
+)
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+ERP_API_URL = os.environ.get("ERP_API_URL", "https://unifi-erp.vercel.app/api/external/linebot")
+ERP_API_TOKEN = os.environ.get("ERP_API_TOKEN", "")
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 SYSTEM_PROMPT = (
     "你是藍圈科技股份有限公司的繁體中文客服助理。"
-    "請用親切、專業的語氣回答使用者的問題。"
-    "如果遇到無法回答的問題，請引導使用者聯繫真人客服。"
+    "請用親切、專業的語氣回答使用者的問題。簡潔回覆，不要太冗長。"
+    "請一律使用繁體中文回覆。\n\n"
+    "你的能力：\n"
+    "- 你可以自動記錄待辦事項和承諾（系統會自動偵測並記錄，不需要用戶特別操作）\n"
+    "- 你可以查詢商品價格（需使用 $ 指令）\n"
+    "- 你可以幫忙設定提醒和催促\n"
+    "- 當用戶要求「記錄」「提醒」「記得」等，直接確認已記錄即可，不要說你做不到\n\n"
+    "注意事項：\n"
+    "- 絕對不要捏造或猜測商品價格，沒有 ERP 資料就說「查無此商品」\n"
+    "- 不要把一般對話硬扯到商品推銷\n"
+    "- 如果遇到無法回答的問題，引導聯繫真人客服：電話 02-21001860、電子郵件 sales@brtech.com.tw、官網 hi5.com.tw"
 )
 
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+QUERY_PARSE_PROMPT = """你是一個查詢解析助理。請從使用者的問題中提取：
+1. customer_code: 客戶代號（格式通常是英文字母+數字，例如 K10、C001），如果沒有提到則為 null
+2. product_keyword: 要查詢的商品關鍵字，如果沒有提到則為 null
 
-# 簡易多輪對話記憶，key 為 user_id，value 為 messages list
+請以 JSON 格式回覆，不要包含其他文字：
+{{"customer_code": "K10", "product_keyword": "U7-Pro"}}
+
+範例：
+「K10的U7-Pro報多少」→ {{"customer_code": "K10", "product_keyword": "U7-Pro"}}
+「查一下UDR定價」→ {{"customer_code": null, "product_keyword": "UDR"}}
+「U7多少錢」→ {{"customer_code": null, "product_keyword": "U7"}}
+「K05 有什麼交換器」→ {{"customer_code": "K05", "product_keyword": "交換器"}}"""
+
+COMMITMENT_PROMPT = """你是一個專門分析對話的助理。你的任務是判斷以下訊息是否包含承諾、約定、待辦事項或任務。
+
+承諾的定義包括：
+- 明確答應要做某件事（例如：「我明天會把報告交出來」）
+- 約定時間或事項（例如：「我們週五開會」）
+- 分配任務（例如：「小明負責寫文件」）
+- 設定截止日期（例如：「下週一前完成」）
+- 客戶要求或老闆交代的事項
+- 明確要求記錄的事項（例如：「幫我記錄...」）
+- 包含「提醒我」「提醒」「記得」「別忘了」等提醒用語的訊息，這些一律視為待辦事項
+
+不算承諾的例子：
+- 一般問候或閒聊
+- 提問（「什麼時候開會？」）
+- 描述過去已完成的事
+- 抱怨或情緒發洩
+
+請以以下 JSON 格式回覆，不要包含其他文字：
+{{"is_commitment": true, "items": [{{"content": "承諾的具體內容", "due_date": "YYYY-MM-DD 或 null", "assignee": "負責人名稱 或 null"}}]}}
+
+今天的日期是 {today}。
+如果提到「明天」，請換算成具體日期。
+如果提到「下週X」，請換算成具體日期。
+如果沒有找到任何承諾，回傳 {{"is_commitment": false, "items": []}}"""
+
+HELPER_TRIGGER = "小幫手"
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+
+class Commitment(Base):
+    __tablename__ = "commitments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_type = Column(String(10), nullable=False)
+    source_id = Column(String(64), nullable=False)
+    source_name = Column(String(128), nullable=True)
+    user_id = Column(String(64), nullable=False)
+    user_name = Column(String(128), nullable=True)
+    content = Column(Text, nullable=False)
+    due_date = Column(Date, nullable=True)
+    status = Column(String(16), default="pending")
+    completed_by = Column(String(128), nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+
+class GroupAlias(Base):
+    __tablename__ = "group_aliases"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    alias = Column(String(32), nullable=False, unique=True)
+    group_id = Column(String(64), nullable=False)
+    group_name = Column(String(128), nullable=True)
+
+
+class Staff(Base):
+    __tablename__ = "staff"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), nullable=False, unique=True)
+    user_name = Column(String(128), nullable=True)
+    email = Column(String(128), nullable=True)
+    role = Column(String(32), nullable=True)
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_group_id = Column(String(64), nullable=False)
+    target_alias = Column(String(32), nullable=True)
+    content = Column(Text, nullable=False)
+    scheduled_date = Column(Date, nullable=True)
+    interval_hours = Column(Integer, nullable=True)
+    max_count = Column(Integer, default=1)
+    sent_count = Column(Integer, default=0)
+    next_send_at = Column(DateTime, nullable=True)
+    status = Column(String(16), default="active")
+    reply_type = Column(String(16), nullable=True)
+    created_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class MessageLog(Base):
+    __tablename__ = "message_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_type = Column(String(10), nullable=False)
+    source_id = Column(String(64), nullable=False)
+    source_name = Column(String(128), nullable=True)
+    user_id = Column(String(64), nullable=False)
+    user_name = Column(String(128), nullable=True)
+    is_staff = Column(Boolean, default=False)
+    is_bot_reply = Column(Boolean, default=False)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, nullable=False)
+
+
+engine = None
+SessionLocal = None
+
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    SessionLocal = sessionmaker(bind=engine)
+
+# ---------------------------------------------------------------------------
+# Scheduler & App
+# ---------------------------------------------------------------------------
+scheduler = AsyncIOScheduler()
+
+
+def migrate_db():
+    """Add missing columns to existing tables."""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    if "commitments" in insp.get_table_names():
+        cols = [c["name"] for c in insp.get_columns("commitments")]
+        with engine.connect() as conn:
+            if "source_name" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN source_name VARCHAR(128)"))
+                logger.info("Added source_name column to commitments")
+            if "completed_by" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN completed_by VARCHAR(128)"))
+                logger.info("Added completed_by column to commitments")
+            if "completed_at" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN completed_at TIMESTAMP"))
+                logger.info("Added completed_at column to commitments")
+            conn.commit()
+    if "settings" not in insp.get_table_names():
+        Base.metadata.tables["settings"].create(engine)
+        logger.info("Created settings table")
+    if "staff" in insp.get_table_names():
+        cols = [c["name"] for c in insp.get_columns("staff")]
+        with engine.connect() as conn:
+            if "email" not in cols:
+                conn.execute(text("ALTER TABLE staff ADD COLUMN email VARCHAR(128)"))
+                logger.info("Added email column to staff")
+            if "role" not in cols:
+                conn.execute(text("ALTER TABLE staff ADD COLUMN role VARCHAR(32)"))
+                logger.info("Added role column to staff")
+            conn.commit()
+    if "reminders" not in insp.get_table_names():
+        Base.metadata.tables["reminders"].create(engine)
+        logger.info("Created reminders table")
+    if "message_logs" not in insp.get_table_names():
+        Base.metadata.tables["message_logs"].create(engine)
+        logger.info("Created message_logs table")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if engine:
+        Base.metadata.create_all(engine)
+        migrate_db()
+        logger.info("Database tables ready")
+    scheduler.add_job(
+        daily_report_job,
+        CronTrigger(hour=9, minute=0, timezone="Asia/Taipei"),
+        id="daily_report",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        reminder_job,
+        CronTrigger(minute=0, timezone="Asia/Taipei"),
+        id="reminder_check",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        monthly_cleanup_job,
+        CronTrigger(day=1, hour=3, minute=0, timezone="Asia/Taipei"),
+        id="monthly_cleanup",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("Scheduler started")
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Session middleware for dashboard auth
+SESSION_SECRET = os.environ.get("SESSION_SECRET_KEY", "change-me-in-production-" + hashlib.sha256(LINE_CHANNEL_SECRET.encode()).hexdigest()[:16])
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=86400)  # 24h
+
+# Templates & static files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+logger.info(f"Templates dir: {TEMPLATES_DIR}, exists: {os.path.exists(TEMPLATES_DIR)}")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# ---------------------------------------------------------------------------
+# Conversation history (in-memory)
+# ---------------------------------------------------------------------------
 conversation_history: dict[str, list[dict]] = defaultdict(list)
-MAX_HISTORY = 20  # 每位使用者最多保留的訊息輪數
+MAX_HISTORY = 20
+
+# Display number → DB ID mapping (refreshed on each report)
+display_id_map: dict[int, int] = {}
+
+# Registration state: user_id → {"step": "username"|"pin", "username": "..."}
+registration_state: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# LINE helpers
+# ---------------------------------------------------------------------------
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -35,6 +293,8 @@ def verify_signature(body: bytes, signature: str) -> bool:
 
 
 async def reply_message(reply_token: str, text: str) -> None:
+    if len(text) > 5000:
+        text = text[:4997] + "..."
     async with httpx.AsyncClient() as client:
         await client.post(
             "https://api.line.me/v2/bot/message/reply",
@@ -49,25 +309,1004 @@ async def reply_message(reply_token: str, text: str) -> None:
         )
 
 
-def chat_with_claude(user_id: str, user_message: str) -> str:
+async def push_message(to: str, text: str) -> None:
+    if len(text) > 5000:
+        text = text[:4997] + "..."
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "to": to,
+                "messages": [{"type": "text", "text": text}],
+            },
+        )
+
+
+async def get_user_name(user_id: str, group_id: str | None = None) -> str:
+    if group_id:
+        url = f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+    else:
+        url = f"https://api.line.me/v2/bot/profile/{user_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        )
+        if resp.status_code == 200:
+            return resp.json().get("displayName", "未知")
+    return "未知"
+
+
+async def get_group_name(group_id: str) -> str:
+    url = f"https://api.line.me/v2/bot/group/{group_id}/summary"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        )
+        if resp.status_code == 200:
+            return resp.json().get("groupName", "未知群組")
+    return "未知群組"
+
+
+# ---------------------------------------------------------------------------
+# Settings helpers
+# ---------------------------------------------------------------------------
+
+
+def get_setting(key: str) -> str | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        s = db.query(Setting).filter_by(key=key).first()
+        return s.value if s else None
+    finally:
+        db.close()
+
+
+def set_setting(key: str, value: str) -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        s = db.query(Setting).filter_by(key=key).first()
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+        db.commit()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Staff helpers
+# ---------------------------------------------------------------------------
+
+
+def register_staff(user_id: str, user_name: str, email: str = "", role: str = "") -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.query(Staff).filter_by(user_id=user_id).first()
+        if existing:
+            existing.user_name = user_name
+            if email:
+                existing.email = email
+            if role:
+                existing.role = role
+        else:
+            db.add(Staff(user_id=user_id, user_name=user_name, email=email, role=role))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_staff_email(user_id: str) -> str:
+    if not SessionLocal:
+        return ""
+    db = SessionLocal()
+    try:
+        s = db.query(Staff).filter_by(user_id=user_id).first()
+        return s.email or "" if s else ""
+    finally:
+        db.close()
+
+
+def unregister_staff(user_id: str) -> bool:
+    if not SessionLocal:
+        return False
+    db = SessionLocal()
+    try:
+        s = db.query(Staff).filter_by(user_id=user_id).first()
+        if s:
+            db.delete(s)
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def is_staff(user_id: str) -> bool:
+    if not SessionLocal:
+        return False
+    db = SessionLocal()
+    try:
+        return db.query(Staff).filter_by(user_id=user_id).first() is not None
+    finally:
+        db.close()
+
+
+def list_staff() -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    db = SessionLocal()
+    try:
+        members = db.query(Staff).order_by(Staff.user_name).all()
+        if not members:
+            return "尚未註冊任何員工。\n\n員工請私訊 Bot 傳「註冊員工」。"
+        lines = ["員工名冊：\n"]
+        for m in members:
+            lines.append(f"  • {m.user_name}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Group alias helpers
+# ---------------------------------------------------------------------------
+
+
+def set_group_alias(alias: str, group_id: str, group_name: str) -> None:
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+        if existing:
+            existing.group_id = group_id
+            existing.group_name = group_name
+        else:
+            db.add(GroupAlias(alias=alias.upper(), group_id=group_id, group_name=group_name))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_group_by_alias(alias: str) -> GroupAlias | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        return db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+    finally:
+        db.close()
+
+
+def list_group_aliases() -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    db = SessionLocal()
+    try:
+        aliases = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        if not aliases:
+            return "尚未綁定任何群組編號。\n\n到各群組傳「綁定 G10」即可綁定。"
+        lines = ["群組列表：\n"]
+        for a in aliases:
+            lines.append(f"  {a.alias} → {a.group_name}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# LLM
+# ---------------------------------------------------------------------------
+
+
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def call_llm(messages: list[dict], max_tokens: int = 1024) -> str:
+    if LLM_PROVIDER == "claude" and ANTHROPIC_API_KEY:
+        # Extract system message
+        system_text = ""
+        chat_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text += m["content"] + "\n"
+            else:
+                chat_messages.append(m)
+        with httpx.Client(timeout=60) as client:
+            body = {
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": max_tokens,
+                "messages": chat_messages,
+            }
+            if system_text.strip():
+                body["system"] = system_text.strip()
+            resp = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+        return resp.json()["content"][0]["text"]
+    else:
+        # Fallback to Groq
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": max_tokens,
+                    "messages": messages,
+                },
+            )
+            resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+def chat_with_llm(user_id: str, user_message: str) -> str:
     history = conversation_history[user_id]
     history.append({"role": "user", "content": user_message})
 
-    # 只保留最近 MAX_HISTORY 則訊息
     if len(history) > MAX_HISTORY:
         conversation_history[user_id] = history[-MAX_HISTORY:]
         history = conversation_history[user_id]
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=history,
-    )
-
-    assistant_text = response.content[0].text
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    assistant_text = call_llm(messages)
     history.append({"role": "assistant", "content": assistant_text})
     return assistant_text
+
+
+def extract_commitments(message_text: str, user_name: str) -> dict | None:
+    today_str = date.today().isoformat()
+    system_msg = COMMITMENT_PROMPT.format(today=today_str)
+    user_msg = f"發送者：{user_name}\n訊息內容：{message_text}"
+
+    try:
+        raw = call_llm(
+            [{"role": "system", "content": system_msg},
+             {"role": "user", "content": user_msg}],
+            max_tokens=512,
+        )
+        json_match = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
+        json_str = json_match.group(1).strip() if json_match else raw.strip()
+        return json.loads(json_str)
+    except Exception as e:
+        logger.warning(f"Commitment extraction failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reminder helpers
+# ---------------------------------------------------------------------------
+
+
+def create_reminder(
+    target_group_id: str, target_alias: str, content: str,
+    created_by: str, scheduled_date: date | None = None,
+    interval_hours: int | None = None, max_count: int = 1,
+) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        if scheduled_date:
+            # Schedule for 9:00 AM on that date
+            next_send = datetime.combine(scheduled_date, datetime.min.time().replace(hour=9))
+            if next_send <= now:
+                next_send = now  # If date is today/past, send immediately
+        elif interval_hours:
+            next_send = now  # Send first one immediately
+        else:
+            next_send = now
+
+        r = Reminder(
+            target_group_id=target_group_id,
+            target_alias=target_alias,
+            content=content,
+            scheduled_date=scheduled_date,
+            interval_hours=interval_hours,
+            max_count=max_count,
+            sent_count=0,
+            next_send_at=next_send,
+            status="active",
+            created_by=created_by,
+        )
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+def get_active_reminders_for_group(group_id: str) -> list[Reminder]:
+    if not SessionLocal:
+        return []
+    db = SessionLocal()
+    try:
+        return db.query(Reminder).filter_by(
+            target_group_id=group_id, status="active"
+        ).order_by(Reminder.created_at).all()
+    finally:
+        db.close()
+
+
+def get_all_active_reminders() -> list[Reminder]:
+    if not SessionLocal:
+        return []
+    db = SessionLocal()
+    try:
+        return db.query(Reminder).filter_by(status="active").order_by(Reminder.next_send_at).all()
+    finally:
+        db.close()
+
+
+def update_reminder_status(reminder_id: int, status: str, reply_type: str | None = None) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        r = db.query(Reminder).filter_by(id=reminder_id).first()
+        if r:
+            r.status = status
+            if reply_type:
+                r.reply_type = reply_type
+            db.commit()
+            db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+def update_reminder_reschedule(reminder_id: int, new_date: date) -> Reminder | None:
+    if not SessionLocal:
+        return None
+    db = SessionLocal()
+    try:
+        r = db.query(Reminder).filter_by(id=reminder_id).first()
+        if r:
+            r.scheduled_date = new_date
+            r.next_send_at = datetime.combine(new_date, datetime.min.time().replace(hour=9))
+            r.sent_count = 0
+            r.status = "active"
+            db.commit()
+            db.refresh(r)
+        return r
+    finally:
+        db.close()
+
+
+async def send_reminder_message(reminder: Reminder) -> None:
+    """Send reminder with numbered options to target group."""
+    lines = [
+        f"[#{reminder.id}] 提醒：{reminder.content}",
+        "",
+        f"  #{reminder.id}-1 收到",
+        f"  #{reminder.id}-2 已完成",
+        f"  #{reminder.id}-3 改時間",
+    ]
+    if reminder.sent_count > 0:
+        lines[0] = f"[#{reminder.id}] 再次提醒（第 {reminder.sent_count + 1} 次）：{reminder.content}"
+    await push_message(reminder.target_group_id, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# ERP API
+# ---------------------------------------------------------------------------
+
+
+def erp_query(action: str, **params) -> dict | list | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        from urllib.parse import quote
+        qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        url = f"{ERP_API_URL}?action={action}&{qs}"
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(
+                url,
+                headers={"Authorization": f"Bearer {ERP_API_TOKEN}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP query failed: {e}")
+    return None
+
+
+def parse_product_query(question: str) -> dict:
+    """Use LLM to extract customer_code and product_keyword from question."""
+    try:
+        raw = call_llm(
+            [{"role": "system", "content": QUERY_PARSE_PROMPT},
+             {"role": "user", "content": question}],
+            max_tokens=128,
+        )
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception as e:
+        logger.warning(f"Query parse failed: {e}")
+    return {"customer_code": None, "product_keyword": question}
+
+
+PRICE_KEYWORDS = re.compile(
+    r"(查|報價|價錢|多少錢|價格|定價|售價|查價|幾塊|怎麼賣|U\d|UDR|UDM|UDW|USW|UCG|UXG|UAP)",
+    re.IGNORECASE,
+)
+
+
+def is_product_query(text: str) -> bool:
+    """Detect if a message is asking about products/pricing."""
+    return bool(PRICE_KEYWORDS.search(text))
+
+
+def build_erp_context(question: str, group_source_id: str | None = None,
+                      allow_customer_pricing: bool = False,
+                      force_customer_code: str | None = None) -> str:
+    """Query ERP and build context string for LLM."""
+    parsed = parse_product_query(question)
+    customer_code = force_customer_code or parsed.get("customer_code")
+    keyword = parsed.get("product_keyword") or question
+
+    erp_context = ""
+    products = erp_search_with_fallback(keyword)
+    if not products:
+        return "\n\n[ERP 系統查無「" + keyword + "」相關商品。請告知用戶查無此商品，不要自行編造價格。]"
+
+    plines = []
+    for p in products[:5]:
+        price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
+        plines.append(f"{p['sku']} - {p['name']} - 建議售價{price} - {p.get('availability', '')}")
+    erp_context = "\n\n以下是 ERP 系統中的商品資料（價格單位為新台幣 NTD），請嚴格根據這些資料回答，絕對不要捏造價格：\n" + "\n".join(plines)
+
+    if not allow_customer_pricing:
+        erp_context += "\n注意：此用戶沒有客戶專屬定價權限，只提供建議售價。不要透露任何折扣資訊。"
+        return erp_context
+
+    # Determine customer code: explicit in question > group alias
+    if not customer_code and group_source_id and SessionLocal:
+        db = SessionLocal()
+        try:
+            alias_obj = db.query(GroupAlias).filter_by(group_id=group_source_id).first()
+            if alias_obj:
+                customer_code = alias_obj.alias
+        finally:
+            db.close()
+
+    # Get customer-specific quotes
+    if customer_code and products:
+        customer_info = erp_get_customer(customer_code)
+        if customer_info:
+            erp_context += f"\n\n客戶資訊：代號 {customer_code}，名稱 {customer_info.get('name', '')}，等級 {customer_info.get('tier', '')}"
+        for p in products[:3]:
+            quote = erp_query("quote", code=customer_code, sku=p["sku"])
+            if quote and isinstance(quote, dict) and "error" not in quote:
+                pr = quote.get("pricing", {})
+                erp_context += (
+                    f"\n{p['sku']} 客戶報價：建議售價 NT${pr.get('msrp', 0):,}，"
+                    f"客戶價 NT${pr.get('unitPrice', 0):,}，"
+                    f"折扣 {pr.get('discount', 0)}%，"
+                    f"價格來源：{pr.get('source', 'msrp')}，"
+                    f"庫存：{quote.get('availability', '洽詢')}"
+                )
+
+        erp_context += (
+            "\n\n回覆格式範例：「U7-Pro 您的專屬價 NT$6,934（建議售價 NT$7,299，折扣 5%）・約四個工作天可交貨」"
+            "\n價格來源說明：customer_specific=客戶專屬價、tier=等級定價、brand=品牌折扣、msrp=無特價"
+        )
+
+    return erp_context
+
+
+def erp_search_with_fallback(keyword: str) -> list | None:
+    """Search ERP with fallback: try multiple formats."""
+    variations = [
+        keyword,                                          # U7-Pro (original)
+        keyword.replace(" ", "-"),                         # U7 PRO → U7-PRO
+        keyword.replace(" ", ""),                           # U7 PRO → U7PRO
+        keyword.replace("-", " "),                          # U7-Pro → U7 Pro
+        keyword.replace("-", ""),                           # U7-Pro → U7Pro
+        re.sub(r"([A-Za-z])(\d)", r"\1-\2", keyword),      # U7PRO → U7-PRO
+        re.sub(r"(\d)([A-Za-z])", r"\1-\2", keyword.replace(" ", "")),  # U7 PRO → U7-PRO
+        re.sub(r"[+\-*/()（）]", "", keyword),              # U6+ → U6
+    ]
+    seen = set()
+    for v in variations:
+        v = v.strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        results = erp_query("products", search=v)
+        if results and isinstance(results, list) and len(results) > 0:
+            return results
+    return None
+
+
+def erp_search_products(keyword: str) -> str:
+    results = erp_search_with_fallback(keyword)
+    if not results:
+        return f"找不到與「{keyword}」相關的商品。"
+    items = results[:10]
+    lines = [f"搜尋「{keyword}」找到 {len(results)} 項商品：\n"]
+    for p in items:
+        price = f"${p['msrp']:,}" if p.get("msrp") else "洽詢"
+        stock = p.get("availability", "")
+        lines.append(f"• {p['sku']} — {p['name']}  建議售價 {price}  {stock}")
+    if len(results) > 10:
+        lines.append(f"\n...還有 {len(results) - 10} 項，請用更精確的關鍵字搜尋")
+    return "\n".join(lines)
+
+
+def erp_get_quote(customer_code: str, sku: str) -> str:
+    result = erp_query("quote", code=customer_code, sku=sku)
+    if not result or isinstance(result, dict) and "error" in result:
+        err = result.get("error", "") if isinstance(result, dict) else ""
+        return f"無法查詢報價：{err}" if err else "無法查詢報價"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def erp_verify_staff(username: str, pin: str) -> dict | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                ERP_API_URL,
+                headers={
+                    "Authorization": f"Bearer {ERP_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={"action": "verify_staff", "username": username, "pin": pin},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP verify_staff failed: {e}")
+    return None
+
+
+def erp_create_quote(customer_code: str, items: list[dict], created_by_email: str) -> dict | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                ERP_API_URL,
+                headers={
+                    "Authorization": f"Bearer {ERP_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "action": "create_quote",
+                    "customerCode": customer_code,
+                    "createdByEmail": created_by_email,
+                    "items": items,
+                },
+            )
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"ERP create_quote failed: {e}")
+    return None
+
+
+def erp_download_pdf(quote_id: str) -> bytes | None:
+    if not ERP_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(
+                f"{ERP_API_URL}?action=pdf&quoteId={quote_id}&template=detailed",
+                headers={"Authorization": f"Bearer {ERP_API_TOKEN}"},
+            )
+            if resp.status_code == 200 and "pdf" in resp.headers.get("content-type", ""):
+                return resp.content
+    except Exception as e:
+        logger.warning(f"ERP download_pdf failed: {e}")
+    return None
+
+
+# In-memory PDF cache for temporary download links
+pdf_cache: dict[str, bytes] = {}
+
+
+def erp_get_customer(customer_code: str) -> dict | None:
+    result = erp_query("customer", code=customer_code)
+    if isinstance(result, dict) and "error" not in result:
+        return result
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+
+def save_commitments(
+    extraction: dict, source_type: str, source_id: str,
+    user_id: str, user_name: str, source_name: str = "",
+) -> list[Commitment]:
+    if not SessionLocal:
+        return []
+    saved = []
+    db = SessionLocal()
+    try:
+        for item in extraction.get("items", []):
+            due = None
+            if item.get("due_date"):
+                try:
+                    due = date.fromisoformat(item["due_date"])
+                except ValueError:
+                    pass
+            c = Commitment(
+                source_type=source_type,
+                source_id=source_id,
+                source_name=source_name,
+                user_id=user_id,
+                user_name=item.get("assignee") or user_name,
+                content=item["content"],
+                due_date=due,
+                status="pending",
+            )
+            db.add(c)
+            saved.append(c)
+        db.commit()
+        for c in saved:
+            db.refresh(c)
+    finally:
+        db.close()
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+COMPLETE_RE = re.compile(r"^(?:完成\s*#?|-)(\d+)$")
+DELETE_RE = re.compile(r"^刪除\s*#?(\d+)$")
+BIND_RE = re.compile(r"^綁定\s+(\S+)(?:\s+(.+))?$")
+REMOTE_MSG_RE = re.compile(r"^@([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
+PRICE_QUERY_RE = re.compile(r"^\$(.+)$")
+QUOTE_RE = re.compile(r"^報價\s+([A-Za-z0-9]+)\s+(.+)$", re.DOTALL)
+QUOTE_NO_CODE_RE = re.compile(r"^報價\s+(.+)$", re.DOTALL)
+REMIND_RE = re.compile(r"^提醒\s*(\d{1,2}/\d{1,2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$")
+FOLLOW_RE = re.compile(r"^催\s*(.+?)\s*每(\d+)小時\s*催?(\d+)次$")
+TRACK_REPLY_RE = re.compile(r"^#(\d+)-([123])$")
+CANCEL_TRACK_RE = re.compile(r"^取消追蹤\s*#?(\d+)$")
+APPROVE_RE = re.compile(r"^#(\d+)-([YNyn])$")  # 沒指定客戶代號
+
+
+def cmd_report_all() -> str:
+    """管理群組用：列出所有群組的待辦"""
+    global display_id_map
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        items = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .order_by(Commitment.created_at)
+            .all()
+        )
+        if not items:
+            display_id_map = {}
+            return "目前沒有待辦事項。"
+        display_id_map = {}
+        lines = ["全部待辦清單：\n"]
+        for i, c in enumerate(items, 1):
+            display_id_map[i] = c.id
+            due = f"（截止：{c.due_date}）" if c.due_date else ""
+            source = f"[{c.source_name}] " if c.source_name else ""
+            assignee = f"{c.user_name}: " if c.user_name else ""
+            lines.append(f"({i}) {source}{assignee}{c.content} {due}")
+        lines.append(f"\n輸入 -N 完成，例如 -1")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def cmd_report(source_id: str) -> str:
+    global display_id_map
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        items = (
+            db.query(Commitment)
+            .filter_by(source_id=source_id, status="pending")
+            .order_by(Commitment.created_at)
+            .all()
+        )
+        if not items:
+            display_id_map = {}
+            return "目前沒有待辦事項。"
+        display_id_map = {}
+        lines = ["待辦清單：\n"]
+        for i, c in enumerate(items, 1):
+            display_id_map[i] = c.id
+            due = f"（截止：{c.due_date}）" if c.due_date else ""
+            assignee = f"[{c.user_name}] " if c.user_name else ""
+            lines.append(f"({i}) {assignee}{c.content} {due}")
+        lines.append(f"\n輸入 -N 完成，例如 -1")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def cmd_weekly_report_all() -> str:
+    """管理群組用：列出所有群組本週待辦"""
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        today = date.today()
+        end_of_week = today + timedelta(days=(6 - today.weekday()))
+        items = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .filter(Commitment.due_date <= end_of_week)
+            .order_by(Commitment.due_date)
+            .all()
+        )
+        overdue = [c for c in items if c.due_date and c.due_date < today]
+        this_week = [c for c in items if c not in overdue]
+
+        if not items:
+            return "本週沒有到期的待辦事項。"
+
+        lines = ["本週報告（所有群組）：\n"]
+        if overdue:
+            lines.append("⚠ 已逾期：")
+            for c in overdue:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
+        if this_week:
+            lines.append("本週到期：")
+            for c in this_week:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def cmd_weekly_report(source_id: str) -> str:
+    if not SessionLocal:
+        return "資料庫未連線，無法查詢。"
+    db = SessionLocal()
+    try:
+        today = date.today()
+        end_of_week = today + timedelta(days=(6 - today.weekday()))
+        items = (
+            db.query(Commitment)
+            .filter_by(source_id=source_id, status="pending")
+            .filter(Commitment.due_date <= end_of_week)
+            .order_by(Commitment.due_date)
+            .all()
+        )
+        overdue = [c for c in items if c.due_date and c.due_date < today]
+        this_week = [c for c in items if c not in overdue]
+
+        if not items:
+            return "本週沒有到期的待辦事項。"
+
+        lines = ["本週報告：\n"]
+        if overdue:
+            lines.append("⚠ 已逾期：")
+            for c in overdue:
+                lines.append(f"  #{c.id} {c.content}（截止：{c.due_date}）")
+        if this_week:
+            lines.append("本週到期：")
+            for c in this_week:
+                lines.append(f"  #{c.id} {c.content}（截止：{c.due_date}）")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def cmd_complete(item_id: int, use_display: bool = False, completed_by: str = "") -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    # Resolve display number to DB ID
+    db_id = item_id
+    if use_display and item_id in display_id_map:
+        db_id = display_id_map[item_id]
+    elif use_display:
+        return f"找不到序號 ({item_id})，請先打「報告」查看清單。"
+    db = SessionLocal()
+    try:
+        c = db.query(Commitment).filter_by(id=db_id, status="pending").first()
+        if not c:
+            return f"找不到待辦事項，或該事項已完成/刪除。"
+        c.status = "done"
+        c.completed_by = completed_by or "未知"
+        c.completed_at = datetime.now()
+        db.commit()
+        by = f"（{completed_by}）" if completed_by else ""
+        return f"已完成：{c.content} ✓ {by}"
+    finally:
+        db.close()
+
+
+def cmd_delete(item_id: int) -> str:
+    if not SessionLocal:
+        return "資料庫未連線。"
+    db = SessionLocal()
+    try:
+        c = db.query(Commitment).filter_by(id=item_id, status="pending").first()
+        if not c:
+            return f"找不到待辦事項 #{item_id}，或該事項已完成/刪除。"
+        c.status = "deleted"
+        db.commit()
+        return f"已刪除：#{c.id} {c.content}"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Daily report job → push to admin group only
+# ---------------------------------------------------------------------------
+
+
+async def monthly_cleanup_job():
+    """Clean up data older than 90 days on the 1st of each month."""
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now() - timedelta(days=90)
+
+        # Delete old message logs
+        deleted_msgs = db.query(MessageLog).filter(MessageLog.created_at < cutoff).delete()
+
+        # Delete completed/deleted/rejected commitments older than 90 days
+        deleted_commits = db.query(Commitment).filter(
+            Commitment.created_at < cutoff,
+            Commitment.status.in_(["done", "deleted", "rejected"]),
+        ).delete(synchronize_session=False)
+
+        # Delete completed/expired/cancelled reminders older than 90 days
+        deleted_reminds = db.query(Reminder).filter(
+            Reminder.created_at < cutoff,
+            Reminder.status.in_(["completed", "expired", "cancelled", "confirmed"]),
+        ).delete(synchronize_session=False)
+
+        db.commit()
+        logger.info(f"Monthly cleanup: {deleted_msgs} messages, {deleted_commits} commitments, {deleted_reminds} reminders deleted")
+
+        admin_group = get_setting("admin_group_id")
+        if admin_group:
+            await push_message(
+                admin_group,
+                f"🧹 每月清理完成\n"
+                f"• 訊息日誌：{deleted_msgs}\n"
+                f"• 已完成待辦：{deleted_commits}\n"
+                f"• 已結束追蹤：{deleted_reminds}"
+            )
+    except Exception as e:
+        logger.error(f"Monthly cleanup failed: {e}")
+    finally:
+        db.close()
+
+
+async def reminder_job():
+    """Check and send due reminders every hour."""
+    if not SessionLocal:
+        return
+    admin_group = get_setting("admin_group_id")
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        due = db.query(Reminder).filter(
+            Reminder.status == "active",
+            Reminder.next_send_at <= now,
+        ).all()
+
+        for r in due:
+            try:
+                await send_reminder_message(r)
+                r.sent_count += 1
+                # Calculate next send time
+                if r.interval_hours and r.sent_count < r.max_count:
+                    r.next_send_at = now + timedelta(hours=r.interval_hours)
+                else:
+                    if r.sent_count >= r.max_count:
+                        r.status = "expired"
+                        if admin_group:
+                            alias = f"[{r.target_alias}] " if r.target_alias else ""
+                            await push_message(
+                                admin_group,
+                                f"⚠ {alias}追蹤 #{r.id} 已催 {r.sent_count} 次未回覆：{r.content}"
+                            )
+                    else:
+                        r.next_send_at = None  # One-time reminder, done sending
+                        # Don't mark as expired yet, wait for reply
+                r.last_reminded_at = now
+                db.commit()
+            except Exception as e:
+                logger.error(f"Reminder #{r.id} send failed: {e}")
+    except Exception as e:
+        logger.error(f"Reminder job failed: {e}")
+    finally:
+        db.close()
+
+
+async def daily_report_job():
+    if not SessionLocal:
+        return
+    admin_group = get_setting("admin_group_id")
+    if not admin_group:
+        logger.info("No admin group set, skipping daily report")
+        return
+
+    db = SessionLocal()
+    try:
+        today = date.today()
+        pending = (
+            db.query(Commitment)
+            .filter_by(status="pending")
+            .order_by(Commitment.due_date.nulls_last(), Commitment.created_at)
+            .all()
+        )
+        if not pending:
+            await push_message(admin_group, "每日待辦報告：\n\n目前沒有待辦事項。")
+            return
+
+        overdue = [c for c in pending if c.due_date and c.due_date < today]
+        today_items = [c for c in pending if c.due_date == today]
+        other = [c for c in pending if c not in overdue and c not in today_items]
+
+        lines = ["每日待辦報告：\n"]
+        if overdue:
+            lines.append("⚠ 逾期：")
+            for c in overdue:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}（截止：{c.due_date}）")
+        if today_items:
+            lines.append("今日到期：")
+            for c in today_items:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content}")
+        if other:
+            lines.append("待處理：")
+            for c in other:
+                source = f"[{c.source_name}] " if c.source_name else ""
+                due = f"（截止：{c.due_date}）" if c.due_date else ""
+                lines.append(f"  #{c.id} {source}{c.user_name}: {c.content} {due}")
+
+        lines.append(f"\n共 {len(pending)} 項待辦")
+        await push_message(admin_group, "\n".join(lines))
+        logger.info("Daily report sent to admin group")
+    except Exception as e:
+        logger.error(f"Daily report job failed: {e}")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
 
 
 @app.post("/callback")
@@ -79,21 +1318,1414 @@ async def callback(request: Request) -> dict:
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
+    admin_group = get_setting("admin_group_id")
 
     for event in data.get("events", []):
         if event["type"] != "message" or event["message"]["type"] != "text":
             continue
 
-        user_id = event["source"]["userId"]
-        user_text = event["message"]["text"]
-        reply_token = event["replyToken"]
+        source = event["source"]
+        source_type = source.get("type", "user")
+        user_id = source.get("userId", "")
 
-        assistant_reply = chat_with_claude(user_id, user_text)
-        await reply_message(reply_token, assistant_reply)
+        if source_type == "group":
+            source_id = source["groupId"]
+            group_id = source_id
+        elif source_type == "room":
+            source_id = source["roomId"]
+            group_id = None
+        else:
+            source_id = user_id
+            group_id = None
+
+        user_text = event["message"]["text"].strip()
+        reply_token = event["replyToken"]
+        is_admin_group = admin_group and source_id == admin_group
+
+        # Log message to DB (non-blocking fail)
+        if SessionLocal:
+            log_db = SessionLocal()
+            try:
+                group_name_for_log = ""
+                if source_type == "group":
+                    try:
+                        group_name_for_log = await get_group_name(source_id)
+                    except Exception:
+                        pass
+                user_name_for_log = ""
+                try:
+                    user_name_for_log = await get_user_name(
+                        user_id, group_id if source_type == "group" else None
+                    )
+                except Exception:
+                    pass
+                log_db.add(MessageLog(
+                    source_type=source_type, source_id=source_id,
+                    source_name=group_name_for_log,
+                    user_id=user_id, user_name=user_name_for_log,
+                    is_staff=is_staff(user_id),
+                    is_bot_reply=False,
+                    text=user_text,
+                ))
+                log_db.commit()
+            except Exception as e:
+                logger.warning(f"Message log failed: {e}")
+            finally:
+                log_db.close()
+
+        # State for reschedule flow
+        reschedule_state: dict = {}
+
+        try:
+            # --- Tracking reply: #5-1, #5-2, #5-3 ---
+            tr = TRACK_REPLY_RE.match(user_text)
+            if tr:
+                rid = int(tr.group(1))
+                choice = int(tr.group(2))
+                r = update_reminder_status(
+                    rid,
+                    "confirmed" if choice == 1 else "completed" if choice == 2 else "active",
+                    "收到" if choice == 1 else "已完成" if choice == 2 else "改時間",
+                )
+                if r:
+                    if choice == 1:
+                        await reply_message(reply_token, "好的，已確認收到 ✓")
+                    elif choice == 2:
+                        await reply_message(reply_token, f"已完成 ✓ #{rid} {r.content}")
+                    elif choice == 3:
+                        await reply_message(reply_token, "請問改到什麼時候？（格式：月/日，例如 4/20）")
+                        reschedule_state[source_id] = rid
+                    if admin_group:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        status_text = ["", "收到", "已完成", "改時間"][choice]
+                        await push_message(admin_group, f"{alias}追蹤 #{rid} 回覆：{status_text}")
+                else:
+                    await reply_message(reply_token, f"找不到追蹤 #{rid}")
+                continue
+
+            # --- Approval: #30-Y / #30-N ---
+            ap = APPROVE_RE.match(user_text)
+            if ap and is_staff(user_id):
+                cid = int(ap.group(1))
+                choice = ap.group(2).upper()
+                if SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        c = db.query(Commitment).filter_by(id=cid).first()
+                        if c and c.status == "pending_approval":
+                            if choice == "Y":
+                                c.status = "pending"
+                                db.commit()
+                                await reply_message(reply_token, f"已接受 → 加入待辦 ✓\n#{c.id} {c.content}")
+                                # Notify customer group
+                                target = get_group_by_alias(c.source_name) if c.source_name else None
+                                if c.source_id and c.source_type == "group":
+                                    await push_message(
+                                        c.source_id,
+                                        "好的，我們會盡快為您處理，謝謝！"
+                                    )
+                            elif choice == "N":
+                                c.status = "rejected"
+                                db.commit()
+                                await reply_message(reply_token, f"已略過 #{c.id}（記錄保留）")
+                        elif c and c.status != "pending_approval":
+                            await reply_message(reply_token, f"#{cid} 已處理過（狀態：{c.status}）")
+                        else:
+                            await reply_message(reply_token, f"找不到 #{cid}")
+                    finally:
+                        db.close()
+                continue
+
+            # --- Text keyword reply: 收到/已完成/改時間 (single active reminder) ---
+            if user_text in ("收到", "已完成", "改時間") and source_type == "group":
+                active = get_active_reminders_for_group(source_id)
+                if len(active) == 1:
+                    r = active[0]
+                    if user_text == "收到":
+                        update_reminder_status(r.id, "confirmed", "收到")
+                        await reply_message(reply_token, "好的，已確認收到 ✓")
+                    elif user_text == "已完成":
+                        update_reminder_status(r.id, "completed", "已完成")
+                        await reply_message(reply_token, f"已完成 ✓ #{r.id} {r.content}")
+                    elif user_text == "改時間":
+                        await reply_message(reply_token, "請問改到什麼時候？（格式：月/日，例如 4/20）")
+                    if admin_group:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        await push_message(admin_group, f"{alias}追蹤 #{r.id} 回覆：{user_text}")
+                    continue
+                elif len(active) > 1:
+                    lines = ["目前有多筆追蹤，請指定編號：\n"]
+                    for a in active:
+                        lines.append(f"  #{a.id}-1 收到（{a.content[:20]}）")
+                    await reply_message(reply_token, "\n".join(lines))
+                    continue
+
+            # --- Reschedule date reply (月/日 format) ---
+            date_match = re.match(r"^(\d{1,2})/(\d{1,2})$", user_text)
+            if date_match and source_type == "group":
+                active = get_active_reminders_for_group(source_id)
+                if active:
+                    month = int(date_match.group(1))
+                    day = int(date_match.group(2))
+                    year = date.today().year
+                    try:
+                        new_date = date(year, month, day)
+                        r = active[0]  # Reschedule the most recent active one
+                        update_reminder_reschedule(r.id, new_date)
+                        await reply_message(reply_token, f"已改期 #{r.id} 到 {new_date}，届時會再提醒您 ✓")
+                        if admin_group:
+                            alias = f"[{r.target_alias}] " if r.target_alias else ""
+                            await push_message(admin_group, f"{alias}追蹤 #{r.id} 改期到 {new_date}")
+                    except ValueError:
+                        await reply_message(reply_token, "日期格式錯誤，請用 月/日（例如 4/20）")
+                    continue
+
+            # --- Tracking dashboard ---
+            if user_text == "追蹤中" and is_staff(user_id):
+                reminders = get_all_active_reminders()
+                if not reminders:
+                    await reply_message(reply_token, "目前沒有進行中的追蹤。")
+                else:
+                    lines = ["進行中的追蹤：\n"]
+                    for r in reminders:
+                        alias = f"[{r.target_alias}] " if r.target_alias else ""
+                        due = f"排定 {r.scheduled_date}" if r.scheduled_date else ""
+                        interval = f"每 {r.interval_hours}h" if r.interval_hours else ""
+                        count = f"已催 {r.sent_count}/{r.max_count}" if r.max_count > 1 else ""
+                        info = " / ".join(filter(None, [due, interval, count]))
+                        lines.append(f"#{r.id} {alias}{r.content}")
+                        if info:
+                            lines.append(f"     {info}")
+                    await reply_message(reply_token, "\n".join(lines))
+                continue
+
+            # --- Cancel tracking ---
+            ct = CANCEL_TRACK_RE.match(user_text)
+            if ct and is_staff(user_id):
+                rid = int(ct.group(1))
+                r = update_reminder_status(rid, "cancelled")
+                if r:
+                    await reply_message(reply_token, f"已取消追蹤 #{rid}：{r.content}")
+                else:
+                    await reply_message(reply_token, f"找不到追蹤 #{rid}")
+                continue
+
+            # --- Help command ---
+            if (user_text == "-BOT" or user_text == "-bot") and is_admin_group and is_staff(user_id):
+                help_lines = [
+                    "藍圈科技 Bot 指令一覽：",
+                    "",
+                    "【查價】",
+                    "  $U7-Pro → 查建議售價",
+                    "  $K01 U7-Pro → 查客戶專屬報價（員工限定）",
+                    "",
+                    "【報價單】（員工限定）",
+                    "  報價 K01",
+                    "  1. U7-Pro x40",
+                    "  2. U7-Lite x10",
+                    "  → 建立報價單（僅管理群組顯示）",
+                    "",
+                    "  @K01 報價",
+                    "  1. U7-Pro x40",
+                    "  → 建立報價單 + 發送到客戶群組",
+                    "",
+                    "【遠端發話】（員工限定）",
+                    "  @K01 訊息內容 → 發送到群組（自動潤飾）",
+                    "",
+                    "【提醒/催促】（員工限定）",
+                    "  @K01 提醒 4/16 寄合約 → 排定提醒",
+                    "  @K01 催 確認時間 每2小時 催3次",
+                    "  追蹤中 → 查看進行中的追蹤",
+                    "  取消追蹤 #5 → 取消",
+                    "",
+                    "【待辦管理】（員工限定）",
+                    "  報告 → 所有群組待辦",
+                    "  本週報告 → 本週到期事項",
+                    "  -1 → 快速完成（最快）",
+                    "  完成 #1 → 標記完成",
+                    "  刪除 #1 → 刪除事項",
+                    "",
+                    "【群組管理】（員工限定）",
+                    "  綁定 K01 → 綁定群組編號",
+                    "  群組列表 → 查看所有綁定群組",
+                    "  設定為管理群組 → 設定管理中心",
+                    "  員工名冊 → 查看員工列表",
+                    "",
+                    "【AI 對話】",
+                    "  小幫手 問題 → AI 回覆（群組用）",
+                    "  直接打字 → AI 回覆（私訊用）",
+                    "",
+                    "【自動功能】",
+                    "  • 群組承諾自動擷取（區分我方/客戶）",
+                    "  • 每天早上 9:00 推播待辦報告",
+                    "",
+                    "輸入 -規則 查看詳細使用規則",
+                ]
+                await reply_message(reply_token, "\n".join(help_lines))
+                continue
+
+            if (user_text == "-規則" or user_text == "-规则") and is_admin_group and is_staff(user_id):
+                rules = [
+                    "使用規則說明：",
+                    "",
+                    "━━━ 指令前綴 ━━━",
+                    "$ → 查價（任何人可查建議售價）",
+                    "@ → 對外操作（發話/發報價單到客戶群組）",
+                    "小幫手 → AI 對話（群組用）",
+                    "- → 系統指令（如 -BOT、-規則）",
+                    "",
+                    "━━━ 報價單規則 ━━━",
+                    "「報價 K01 品項」→ 只在管理群組顯示（預覽）",
+                    "「@K01 報價 品項」→ 建立並發送到客戶群組",
+                    "",
+                    "品項格式（建議用編號分行）：",
+                    "  1. SKU x數量",
+                    "  2. SKU *數量",
+                    "  支援 x X × * 當數量符號",
+                    "  不寫數量預設為 1",
+                    "",
+                    "━━━ 權限規則 ━━━",
+                    "所有人可用：",
+                    "  • $查價（建議售價）",
+                    "  • 小幫手 對話",
+                    "  • 註冊員工（需 ERP 驗證）",
+                    "",
+                    "員工才能用：",
+                    "  • $K01 查客戶專屬價",
+                    "  • 報價/@ 報價 建立報價單",
+                    "  • @遠端發話",
+                    "  • 報告/本週報告/完成/刪除/-N快速完成",
+                    "  • 綁定/群組列表/員工名冊",
+                    "  • -BOT/-規則",
+                    "",
+                    "管理群組限定：",
+                    "  • 設定為管理群組",
+                    "  • -BOT / -規則",
+                    "  • @遠端發話",
+                    "  • 查所有群組報告",
+                    "",
+                    "━━━ 查價權限 ━━━",
+                    "員工在管理群組 → 可查任何客戶報價",
+                    "員工在客戶群組 → 可查該群組客戶報價",
+                    "客戶在自己群組 → 可查自己的報價",
+                    "客戶查別人代號 → 只看到建議售價",
+                    "私訊查價 → 只看到建議售價",
+                    "",
+                    "━━━ 提醒/催促規則 ━━━",
+                    "「@K01 提醒 4/16 訊息」→ 指定日期 9:00 發送",
+                    "「@K01 催 訊息 每2小時 催3次」→ 立刻發第一次",
+                    "",
+                    "提醒訊息帶選項：",
+                    "  #N-1 收到 → 確認",
+                    "  #N-2 已完成 → 結案",
+                    "  #N-3 改時間 → 改期（回覆 月/日）",
+                    "",
+                    "只有 1 個追蹤時可直接打「收到」「已完成」「改時間」",
+                    "多個追蹤時必須用 #N-1 編號指定",
+                    "",
+                    "「追蹤中」→ 查看所有進行中的追蹤",
+                    "「取消追蹤 #N」→ 取消某個追蹤",
+                    "",
+                    "━━━ 群組行為 ━━━",
+                    "客戶群組：自動監聽承諾（區分我方/客戶）",
+                    "管理群組：接收所有承諾通知 + 每日報告",
+                    "私訊：一般 AI 對話 + 自動擷取承諾",
+                ]
+                await reply_message(reply_token, "\n".join(rules))
+                continue
+
+            # --- Staff registration with ERP verification (1:1 only) ---
+            if source_type == "user" and user_id in registration_state:
+                state = registration_state[user_id]
+                if state["step"] == "username":
+                    state["username"] = user_text
+                    state["step"] = "pin"
+                    await reply_message(reply_token, "請輸入你的 LINE Bot 驗證碼（PIN）：")
+                    continue
+                elif state["step"] == "pin":
+                    result = erp_verify_staff(state["username"], user_text)
+                    del registration_state[user_id]
+                    if result and result.get("verified"):
+                        register_staff(user_id, result["name"], result.get("email", ""), result.get("role", ""))
+                        await reply_message(
+                            reply_token,
+                            f"驗證成功！已註冊 {result['name']} 為員工（{result.get('role', '')}）。\n\nBot 在群組中會區分你的訊息為「我方」。"
+                        )
+                    else:
+                        err = result.get("error", "驗證失敗") if result else "無法連接 ERP"
+                        await reply_message(reply_token, f"驗證失敗：{err}\n\n請重新輸入「註冊員工」再試。")
+                    continue
+
+            if user_text == "註冊員工" and source_type == "user":
+                registration_state[user_id] = {"step": "username"}
+                await reply_message(reply_token, "請輸入你的 ERP 帳號（姓名或 email）：")
+                continue
+            if user_text == "取消員工" and source_type == "user":
+                if unregister_staff(user_id):
+                    await reply_message(reply_token, "已取消員工身份。")
+                else:
+                    await reply_message(reply_token, "你尚未註冊為員工。")
+                continue
+
+            # --- Staff list (admin group) ---
+            if user_text == "員工名冊" and is_admin_group and is_staff(user_id):
+                await reply_message(reply_token, list_staff())
+                continue
+
+            # --- Admin group setup command ---
+            if user_text == "設定為管理群組" and source_type == "group" and is_staff(user_id):
+                set_setting("admin_group_id", source_id)
+                await reply_message(reply_token, "已設定此群組為管理群組！\n\n輸入 -BOT 查看所有可用指令。")
+                continue
+
+            # --- Bind group alias (in any group) ---
+            bm = BIND_RE.match(user_text)
+            if bm and source_type == "group" and is_staff(user_id):
+                alias = bm.group(1).upper()
+                custom_name = bm.group(2)
+                gname = custom_name if custom_name else await get_group_name(source_id)
+                set_group_alias(alias, source_id, gname)
+                await reply_message(reply_token, f"已綁定此群組為 {alias}（{gname}）")
+                continue
+
+            # --- Group list command ---
+            if user_text == "群組列表":
+                await reply_message(reply_token, list_group_aliases())
+                continue
+
+            # --- @K01 message → Remote message (LLM polished) ---
+            rm = REMOTE_MSG_RE.match(user_text)
+            if rm and is_admin_group and is_staff(user_id):
+                target_alias = rm.group(1).upper()
+                msg_content = rm.group(2).strip()
+                target = get_group_by_alias(target_alias)
+                if target:
+                    # @K01 提醒 4/12 message → schedule reminder
+                    rm_remind = REMIND_RE.match(msg_content)
+                    if rm_remind:
+                        d_str = rm_remind.group(1)
+                        t_str = rm_remind.group(2)  # optional time "14:30"
+                        msg = rm_remind.group(3).strip()
+                        month, day = map(int, d_str.split("/"))
+                        year = date.today().year
+                        try:
+                            sched_date = date(year, month, day)
+                        except ValueError:
+                            await reply_message(reply_token, "日期格式錯誤")
+                            continue
+                        # Parse time or default to 9:00
+                        hour, minute = 9, 0
+                        if t_str:
+                            hour, minute = map(int, t_str.split(":"))
+                        sched_dt = datetime.combine(sched_date, datetime.min.time().replace(hour=hour, minute=minute))
+                        r = create_reminder(
+                            target.group_id, target_alias, msg,
+                            user_id, scheduled_date=sched_date,
+                        )
+                        # Override next_send_at with exact time
+                        if r and SessionLocal:
+                            db = SessionLocal()
+                            try:
+                                rem = db.query(Reminder).filter_by(id=r.id).first()
+                                if rem:
+                                    rem.next_send_at = sched_dt
+                                    db.commit()
+                            finally:
+                                db.close()
+                        if r:
+                            time_display = f"{hour:02d}:{minute:02d}"
+                            await reply_message(reply_token, f"已排程 #{r.id}：{sched_date} {time_display} 提醒 [{target_alias}] {msg}")
+                        continue
+
+                    # @K01 催 message 每2小時 催3次 → periodic follow-up
+                    rm_follow = FOLLOW_RE.match(msg_content)
+                    if rm_follow:
+                        msg = rm_follow.group(1).strip()
+                        hours = int(rm_follow.group(2))
+                        times = int(rm_follow.group(3))
+                        r = create_reminder(
+                            target.group_id, target_alias, msg,
+                            user_id, interval_hours=hours, max_count=times,
+                        )
+                        if r:
+                            # Send first one immediately
+                            await send_reminder_message(r)
+                            if SessionLocal:
+                                db = SessionLocal()
+                                try:
+                                    rem = db.query(Reminder).filter_by(id=r.id).first()
+                                    if rem:
+                                        rem.sent_count = 1
+                                        rem.next_send_at = datetime.now() + timedelta(hours=hours)
+                                        db.commit()
+                                finally:
+                                    db.close()
+                            await reply_message(reply_token, f"已建立催促 #{r.id}：每 {hours} 小時催 [{target_alias}]，共 {times} 次\n第 1 次已發送")
+                        continue
+
+                    # @K01 報價 ... → create quote and send to customer group
+                    if msg_content.startswith("報價"):
+                        quote_items_str = msg_content[2:].strip()
+                        if not quote_items_str:
+                            await reply_message(reply_token, f"請提供品項。範例：@K01 報價\n1. U7-Pro x40\n2. U7-Lite x10")
+                            continue
+                        # Reuse quote parsing logic
+                        q_items = []
+                        parts = re.split(r"[\n,、]+", quote_items_str)
+                        parse_ok = True
+                        for part in parts:
+                            part = re.sub(r"^\d+[\.\)、]\s*", "", part.strip())
+                            if not part:
+                                continue
+                            m_item = re.match(r"(.+?)\s*[xX×\*]\s*(\d+)\s*$", part)
+                            if not m_item:
+                                m_item = re.match(r"(.+?)\s+(\d+)\s*$", part)
+                            if m_item:
+                                raw_sku = m_item.group(1).strip()
+                                qty = int(m_item.group(2))
+                            else:
+                                raw_sku = part.strip()
+                                qty = 1
+                            products = erp_search_with_fallback(raw_sku)
+                            if products and len(products) == 1:
+                                q_items.append({"sku": products[0]["sku"], "quantity": qty})
+                            elif products and len(products) > 1:
+                                exact = [p for p in products if p["sku"].lower() == raw_sku.lower().replace(" ", "-")]
+                                if exact:
+                                    q_items.append({"sku": exact[0]["sku"], "quantity": qty})
+                                else:
+                                    options = "\n".join(f"  {i+1}. {p['sku']}" for i, p in enumerate(products[:5]))
+                                    await reply_message(reply_token, f"「{raw_sku}」找到多個商品：\n{options}\n請用正確 SKU 重試。")
+                                    parse_ok = False
+                                    break
+                            else:
+                                await reply_message(reply_token, f"找不到商品「{raw_sku}」")
+                                parse_ok = False
+                                break
+                        if not parse_ok or not q_items:
+                            continue
+                        staff_email = get_staff_email(user_id)
+                        if not staff_email:
+                            await reply_message(reply_token, "你的帳號沒有綁定 email，請重新「註冊員工」。")
+                            continue
+                        result = erp_create_quote(target_alias, q_items, staff_email)
+                        if result and result.get("success"):
+                            # Reply to admin group
+                            lines = [f"報價單 {result['quoteNumber']} 已建立！\n",
+                                     f"客戶：{result['customer']['name']}（{target_alias}）"]
+                            for item in result.get("items", []):
+                                lines.append(f"• {item['sku']} x{item['quantity']} 單價 NT${item['unitPrice']:,} 小計 NT${item['lineTotal']:,}")
+                            lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+                            quote_db_id = result.get("quoteId", "")
+                            pdf_dl = ""
+                            if quote_db_id:
+                                pdf_dl = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
+                                lines.append(f"📄 PDF：{pdf_dl}")
+                            await reply_message(reply_token, "\n".join(lines))
+                            # Send to customer group
+                            cust_lines = [f"您好，以下是您的報價單 {result['quoteNumber']}：\n"]
+                            for item in result.get("items", []):
+                                cust_lines.append(f"• {item['name']} x{item['quantity']}  NT${item['unitPrice']:,}")
+                            cust_lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+                            if pdf_dl:
+                                cust_lines.append(f"\n📄 報價單下載：{pdf_dl}")
+                            cust_lines.append("\n如有任何問題請隨時告知，謝謝！")
+                            await push_message(target.group_id, "\n".join(cust_lines))
+                            await push_message(source_id, f"已發送報價單到 [{target_alias} {target.group_name}]")
+                        else:
+                            err = result.get("error", "未知錯誤") if result else "無法連接 ERP"
+                            await reply_message(reply_token, f"建立報價單失敗：{err}")
+                        continue
+
+                    erp_data = ""
+                    if is_product_query(msg_content):
+                        # Extract product keywords from message
+                        parsed = parse_product_query(msg_content)
+                        keywords = parsed.get("product_keyword") or msg_content
+                        # Search each keyword separately (split by 跟/和/、/,)
+                        all_keywords = re.split(r"[跟和、,\s]+", keywords)
+                        erp_lines = []
+                        for kw in all_keywords:
+                            kw = kw.strip()
+                            if not kw:
+                                continue
+                            products = erp_search_with_fallback(kw)
+                            if products and isinstance(products, list):
+                                for p in products[:2]:
+                                    quote = erp_query("quote", code=target_alias, sku=p["sku"])
+                                    if quote and isinstance(quote, dict) and "error" not in quote:
+                                        pr = quote.get("pricing", {})
+                                        erp_lines.append(
+                                            f"{p['sku']}：客戶價 NT${pr.get('unitPrice',0):,}"
+                                            f"（建議售價 NT${pr.get('msrp',0):,}，折扣 {pr.get('discount',0)}%）"
+                                            f"，{quote.get('availability','')}"
+                                        )
+                        if erp_lines:
+                            erp_data = "\n\nERP 報價資料（客戶 " + target_alias + "）：\n" + "\n".join(erp_lines)
+
+                    system_prompt = (
+                        "你是藍圈科技的商務助理。請將以下訊息改寫成專業、禮貌的客戶溝通訊息。"
+                        "使用繁體中文。簡潔即可，不要太長。務必帶入實際價格數字。"
+                    )
+                    if erp_data:
+                        system_prompt += erp_data
+                    polished = call_llm([
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": msg_content},
+                    ], max_tokens=256)
+                    await push_message(target.group_id, polished)
+                    await reply_message(reply_token, f"已發送到 [{target_alias} {target.group_name}]：\n{polished}")
+                else:
+                    await reply_message(reply_token, f"找不到群組 {target_alias}，請先到該群組傳「綁定 {target_alias}」")
+                continue
+
+            # --- Create quote: 報價 K01 U7-Pro x40, U7-Lite x10 ---
+            qm = QUOTE_RE.match(user_text)
+            # Parse quote command
+            cust_code = None
+            items_str = None
+            if qm and is_staff(user_id):
+                cust_code = qm.group(1).upper()
+                items_str = qm.group(2).strip()
+            elif not qm and is_staff(user_id):
+                # Try without customer code → use group alias
+                qm_nc = QUOTE_NO_CODE_RE.match(user_text)
+                if qm_nc and source_type == "group" and SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                    finally:
+                        db.close()
+                    if alias_obj:
+                        cust_code = alias_obj.alias
+                        items_str = qm_nc.group(1).strip()
+
+            if cust_code and items_str:
+                # Parse items - supports:
+                # "U7-Pro x40, U7-Lite x10" (comma separated)
+                # "1. U7-Pro x40\n2. 2216 x10" (numbered lines)
+                quote_items = []
+                # Split by newlines, commas, or 、
+                parts = re.split(r"[\n,、]+", items_str)
+                for part in parts:
+                    part = re.sub(r"^\d+[\.\)、]\s*", "", part.strip())  # Remove "1." "2)" etc.
+                    if not part:
+                        continue
+                    m_item = re.match(r"(.+?)\s*[xX×\*]\s*(\d+)\s*$", part)
+                    if not m_item:
+                        m_item = re.match(r"(.+?)\s+(\d+)\s*$", part)
+                    if not m_item:
+                        # No quantity specified, default to 1
+                        m_item = re.match(r"(.+)", part)
+                        if m_item and m_item.group(1).strip():
+                            raw_sku = m_item.group(1).strip()
+                            products = erp_search_with_fallback(raw_sku)
+                            if products:
+                                resolved_sku = products[0]["sku"]
+                                quote_items.append({"sku": resolved_sku, "quantity": 1})
+                            else:
+                                await reply_message(reply_token, f"找不到商品「{raw_sku}」，請確認型號。")
+                                quote_items = []
+                                break
+                            continue
+                    if m_item:
+                        raw_sku = m_item.group(1).strip()
+                        qty = int(m_item.group(2))
+                        # Resolve SKU via ERP search fallback
+                        products = erp_search_with_fallback(raw_sku)
+                        if products and len(products) == 1:
+                            quote_items.append({"sku": products[0]["sku"], "quantity": qty})
+                        elif products and len(products) > 1:
+                            exact = [p for p in products if p["sku"].lower() == raw_sku.lower().replace(" ", "-")]
+                            if exact:
+                                quote_items.append({"sku": exact[0]["sku"], "quantity": qty})
+                            else:
+                                # Multiple matches → ask user to choose
+                                options = "\n".join(
+                                    f"  {i+1}. {p['sku']} — {p['name']}"
+                                    for i, p in enumerate(products[:5])
+                                )
+                                await reply_message(
+                                    reply_token,
+                                    f"「{raw_sku}」找到多個商品，請用正確 SKU 重新報價：\n\n{options}"
+                                )
+                                quote_items = []
+                                break
+                        else:
+                            await reply_message(reply_token, f"找不到商品「{raw_sku}」，請確認型號。")
+                            quote_items = []
+                            break
+
+                if not quote_items:
+                    await push_message(
+                        source_id,
+                        "無法解析報價品項。格式範例：\n\n報價 K01\n1. UCK-G2-SSD x1\n2. USW-PRO-XG-10-POE x1\n\n或：報價 K01 UCK-G2-SSD *1, CKG2-RM *1"
+                    )
+                    continue
+
+                staff_email = get_staff_email(user_id)
+                if not staff_email:
+                    await reply_message(reply_token, "你的帳號沒有綁定 email，請重新「註冊員工」。")
+                    continue
+
+                result = erp_create_quote(cust_code, quote_items, staff_email)
+                if result and result.get("success"):
+                    lines = [
+                        f"報價單 {result['quoteNumber']} 已建立！\n",
+                        f"客戶：{result['customer']['name']}（{result['customer']['code']}）",
+                        f"建立者：{result.get('createdBy', '')}",
+                        "",
+                    ]
+                    for item in result.get("items", []):
+                        lines.append(
+                            f"• {item['sku']} x{item['quantity']}"
+                            f"  單價 NT${item['unitPrice']:,}"
+                            f"  小計 NT${item['lineTotal']:,}"
+                        )
+                    lines.append(f"\n總金額：NT${result['totalAmount']:,}（{result.get('taxMode', '含稅')}）")
+
+                    await reply_message(reply_token, "\n".join(lines))
+
+                    # Download PDF and create download link
+                    pdf_url_raw = result.get("pdfDownload") or result.get("pdfUrl") or ""
+                    quote_db_id = result.get("quoteId") or ""
+                    # Extract quoteId from URL or use direct field
+                    if not quote_db_id:
+                        id_match = re.search(r"quoteId=([^&]+)", pdf_url_raw)
+                        if id_match:
+                            quote_db_id = id_match.group(1)
+                    if quote_db_id:
+                        try:
+                            pdf_bytes = erp_download_pdf(quote_db_id)
+                            if pdf_bytes:
+                                pdf_cache[quote_db_id] = pdf_bytes
+                                download_url = f"https://web-production-87474.up.railway.app/pdf/{quote_db_id}"
+                                await push_message(
+                                    source_id,
+                                    f"📄 報價單 PDF 下載連結：\n{download_url}"
+                                )
+                            else:
+                                logger.warning("PDF download returned empty")
+                                await push_message(source_id, "⚠ PDF 下載失敗，請到 ERP 系統查看。")
+                        except Exception as e:
+                            logger.error(f"PDF download/send error: {e}")
+                            await push_message(source_id, "⚠ PDF 產生中，請稍後到 ERP 系統下載。")
+                    # Notify admin group
+                    if admin_group and source_id != admin_group:
+                        await push_message(
+                            admin_group,
+                            f"報價單 {result['quoteNumber']} 已建立\n"
+                            f"客戶：{result['customer']['name']}\n"
+                            f"金額：NT${result['totalAmount']:,}"
+                        )
+                else:
+                    err = result.get("error", "未知錯誤") if result else "無法連接 ERP"
+                    await reply_message(reply_token, f"建立報價單失敗：{err}")
+                continue
+
+            # --- $query → Price query ---
+            pq = PRICE_QUERY_RE.match(user_text)
+            if pq:
+                query_text = pq.group(1).strip()
+                staff_user = is_staff(user_id)
+                # Check if first word is a customer code (letter + digits, e.g. K01)
+                # Don't use LLM — regex is reliable
+                cust_match = re.match(r"^([A-Za-z]\d{1,4})\s+(.+)$", query_text)
+                if cust_match:
+                    explicit_customer = cust_match.group(1).upper()
+                    query_text = cust_match.group(2).strip()
+                else:
+                    explicit_customer = None
+
+                # Resolve customer code for pricing
+                resolved_customer = None
+                can_see_customer_price = False
+
+                if staff_user and explicit_customer and is_admin_group:
+                    can_see_customer_price = True
+                    resolved_customer = explicit_customer
+                elif staff_user and explicit_customer and not is_admin_group:
+                    # Staff in non-admin group can't query other customers
+                    can_see_customer_price = False
+                elif staff_user and not explicit_customer:
+                    # Staff without customer code → use group alias
+                    can_see_customer_price = True
+                    if SessionLocal:
+                        db = SessionLocal()
+                        try:
+                            alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                            if alias_obj:
+                                resolved_customer = alias_obj.alias
+                        finally:
+                            db.close()
+                elif not staff_user and not explicit_customer and SessionLocal:
+                    # Non-staff in bound group → own price
+                    db = SessionLocal()
+                    try:
+                        alias_obj = db.query(GroupAlias).filter_by(group_id=source_id).first()
+                        if alias_obj:
+                            can_see_customer_price = True
+                            resolved_customer = alias_obj.alias
+                    finally:
+                        db.close()
+
+                erp_context = build_erp_context(
+                    query_text, source_id,
+                    allow_customer_pricing=can_see_customer_price,
+                    force_customer_code=resolved_customer,
+                )
+                if erp_context:
+                    system_msg = SYSTEM_PROMPT + erp_context + "\n請根據以上資料整理成清楚的報價回覆。"
+                    assistant_reply = call_llm(
+                        [{"role": "system", "content": system_msg},
+                         {"role": "user", "content": query_text}],
+                    )
+                else:
+                    assistant_reply = f"找不到與「{query_text}」相關的商品。"
+                await reply_message(reply_token, assistant_reply)
+                continue
+
+            # --- Commands (admin group sees all, others see own) ---
+            if user_text in ("報告", "待辦清單") and is_staff(user_id):
+                if is_admin_group:
+                    await reply_message(reply_token, cmd_report_all())
+                else:
+                    await reply_message(reply_token, cmd_report(source_id))
+                continue
+            if user_text == "本週報告" and is_staff(user_id):
+                if is_admin_group:
+                    await reply_message(reply_token, cmd_weekly_report_all())
+                else:
+                    await reply_message(reply_token, cmd_weekly_report(source_id))
+                continue
+            m = COMPLETE_RE.match(user_text)
+            if m:
+                num = int(m.group(1))
+                # -N uses display number, 完成 #N uses DB ID
+                is_shortcut = user_text.startswith("-")
+                # Get completer name from staff DB or LINE profile
+                completer = ""
+                if SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        s = db.query(Staff).filter_by(user_id=user_id).first()
+                        completer = s.user_name if s else ""
+                    finally:
+                        db.close()
+                if not completer:
+                    try:
+                        completer = await get_user_name(user_id, group_id if source_type == "group" else None)
+                    except Exception:
+                        completer = "LINE 使用者"
+                await reply_message(reply_token, cmd_complete(num, use_display=is_shortcut, completed_by=completer))
+                continue
+            m = DELETE_RE.match(user_text)
+            if m:
+                await reply_message(reply_token, cmd_delete(int(m.group(1))))
+                continue
+
+            # --- 1:1 chat: conversation + commitment extraction ---
+            if source_type == "user":
+                try:
+                    erp_context = ""
+                    # Check current message and recent history for product context
+                    recent_texts = [user_text]
+                    for msg in conversation_history.get(user_id, [])[-4:]:
+                        if msg.get("role") in ("user", "assistant"):
+                            recent_texts.append(msg.get("content", ""))
+                    if any(is_product_query(t) for t in recent_texts):
+                        # Find the best keyword from recent messages
+                        for t in recent_texts:
+                            if is_product_query(t):
+                                erp_context = build_erp_context(t, allow_customer_pricing=False)
+                                if "[ERP 系統查無" not in erp_context:
+                                    break
+                    system_msg = SYSTEM_PROMPT + erp_context
+                    history = conversation_history[user_id]
+                    history.append({"role": "user", "content": user_text})
+                    if len(history) > MAX_HISTORY:
+                        conversation_history[user_id] = history[-MAX_HISTORY:]
+                        history = conversation_history[user_id]
+                    msgs = [{"role": "system", "content": system_msg}] + history
+                    assistant_reply = call_llm(msgs)
+                    history.append({"role": "assistant", "content": assistant_reply})
+                except Exception as e:
+                    logger.error(f"LLM chat error: {e}")
+                    assistant_reply = "系統暫時無法回應，請稍後再試。"
+                await reply_message(reply_token, assistant_reply)
+
+                # Commitment extraction (skip product/price queries)
+                if not is_product_query(user_text):
+                    user_name = await get_user_name(user_id)
+                    extraction = extract_commitments(user_text, user_name)
+                    if extraction and extraction.get("is_commitment"):
+                        items = extraction.get("items", [])
+                        items_text = "、".join(i["content"] for i in items)
+                        save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name="私訊",
+                        )
+                        if admin_group:
+                            await push_message(
+                                admin_group,
+                                f"[私訊] {user_name} 新增待辦：{items_text}",
+                            )
+
+            # --- Group chat ---
+            elif source_type in ("group", "room"):
+                user_name = await get_user_name(user_id, group_id)
+                group_name = await get_group_name(source_id) if source_type == "group" else "聊天室"
+
+                # 「小幫手」trigger → conversation reply with ERP context
+                if user_text.startswith(HELPER_TRIGGER):
+                    question = user_text[len(HELPER_TRIGGER):].strip()
+                    if question:
+                        try:
+                            has_alias = False
+                            if SessionLocal:
+                                db = SessionLocal()
+                                try:
+                                    has_alias = db.query(GroupAlias).filter_by(group_id=source_id).first() is not None
+                                finally:
+                                    db.close()
+                            erp_context = build_erp_context(
+                                question, source_id,
+                                allow_customer_pricing=(is_admin_group or has_alias),
+                            )
+                            system_msg = SYSTEM_PROMPT + erp_context
+                            history = conversation_history.get(f"group_{source_id}", [])
+                            history.append({"role": "user", "content": question})
+                            if len(history) > MAX_HISTORY:
+                                history = history[-MAX_HISTORY:]
+                            conversation_history[f"group_{source_id}"] = history
+                            msgs = [{"role": "system", "content": system_msg}] + history
+                            assistant_reply = call_llm(msgs)
+                            history.append({"role": "assistant", "content": assistant_reply})
+                        except Exception as e:
+                            logger.error(f"LLM chat error: {e}")
+                            assistant_reply = "系統暫時無法回應，請稍後再試。"
+                        await reply_message(reply_token, assistant_reply)
+                    continue
+
+                # Commitment extraction (silent monitoring)
+                extraction = extract_commitments(user_text, user_name)
+                if extraction and extraction.get("is_commitment"):
+                    items = extraction.get("items", [])
+                    items_text = "、".join(i["content"] for i in items)
+                    sender_is_staff = is_staff(user_id)
+
+                    if sender_is_staff:
+                        # 員工承諾 → 直接進待辦
+                        save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name=group_name,
+                        )
+                        if not is_admin_group:
+                            await reply_message(reply_token, f"已記錄（我方承諾）：{items_text}")
+                        if admin_group and not is_admin_group:
+                            await push_message(
+                                admin_group,
+                                f"[{group_name}] [我方承諾] {user_name}：{items_text}",
+                            )
+                    else:
+                        # 客戶要求 → 記錄但待審核
+                        saved = save_commitments(
+                            extraction, source_type, source_id, user_id, user_name,
+                            source_name=group_name,
+                        )
+                        # 標記為待審核
+                        if saved and SessionLocal:
+                            db = SessionLocal()
+                            try:
+                                for c in saved:
+                                    item = db.query(Commitment).filter_by(id=c.id).first()
+                                    if item:
+                                        item.status = "pending_approval"
+                                db.commit()
+                            finally:
+                                db.close()
+                        # 通知管理群組審核
+                        if admin_group and saved:
+                            for c in saved:
+                                await push_message(
+                                    admin_group,
+                                    f"[{group_name}] 客戶要求：{c.content}\n\n"
+                                    f"  #{c.id}-Y 接受（加入待辦）\n"
+                                    f"  #{c.id}-N 略過（僅記錄）",
+                                )
+
+        except Exception as e:
+            logger.error(f"Event processing error: {e}")
+            try:
+                await reply_message(reply_token, f"處理訊息時發生錯誤：{type(e).__name__}")
+            except Exception:
+                pass
 
     return {"status": "ok"}
+
+
+@app.get("/pdf/{quote_id}")
+async def download_pdf(quote_id: str):
+    from fastapi.responses import Response
+    # Try from cache first
+    pdf_bytes = pdf_cache.get(quote_id)
+    if not pdf_bytes:
+        # Download from ERP on-the-fly
+        pdf_bytes = erp_download_pdf(quote_id)
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={
+        "Content-Disposition": f"inline; filename={quote_id}.pdf"
+    })
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+# ============================================================================
+# Dashboard Routes
+# ============================================================================
+
+
+def dashboard_get_user(request: Request) -> dict | None:
+    """Get logged-in user from session."""
+    user = request.session.get("user")
+    if not user:
+        return None
+    exp = user.get("expires_at", 0)
+    if datetime.now().timestamp() > exp:
+        request.session.clear()
+        return None
+    return user
+
+
+def require_dashboard_auth(request: Request) -> dict:
+    """Raise redirect if not logged in."""
+    user = dashboard_get_user(request)
+    if not user:
+        raise HTTPException(status_code=302, headers={"Location": "/dashboard/login"})
+    return user
+
+
+def require_dashboard_admin(request: Request) -> dict:
+    user = require_dashboard_auth(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    return user
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_root(request: Request):
+    user = dashboard_get_user(request)
+    if user:
+        return RedirectResponse(url="/dashboard/home", status_code=302)
+    return RedirectResponse(url="/dashboard/login", status_code=302)
+
+
+@app.get("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_page(request: Request):
+    return templates.TemplateResponse(request, "login.html", {"error": None})
+
+
+@app.post("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login(request: Request, username: str = Form(...), pin: str = Form(...)):
+    result = erp_verify_staff(username, pin)
+    if not result or not result.get("verified"):
+        err = result.get("error", "驗證失敗") if result else "無法連接 ERP"
+        return templates.TemplateResponse(request, "login.html", {"error": err})
+
+    # Store session
+    request.session["user"] = {
+        "user_name": result.get("name", ""),
+        "email": result.get("email", ""),
+        "role": result.get("role", ""),
+        "expires_at": (datetime.now() + timedelta(hours=24)).timestamp(),
+    }
+    return RedirectResponse(url="/dashboard/home", status_code=302)
+
+
+@app.post("/dashboard/logout")
+async def dashboard_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/dashboard/login", status_code=302)
+
+
+@app.get("/dashboard/home", response_class=HTMLResponse)
+async def dashboard_home(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    stats = {
+        "pending_todos": 0, "tracking_active": 0,
+        "pending_approvals": 0, "today_messages": 0,
+    }
+    recent = {"todos": [], "reminders": [], "approvals": []}
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            stats["pending_todos"] = db.query(Commitment).filter_by(status="pending").count()
+            stats["tracking_active"] = db.query(Reminder).filter_by(status="active").count()
+            stats["pending_approvals"] = db.query(Commitment).filter_by(status="pending_approval").count()
+            stats["today_messages"] = db.query(MessageLog).filter(MessageLog.created_at >= today_start).count()
+            recent["todos"] = db.query(Commitment).filter_by(status="pending").order_by(Commitment.created_at.desc()).limit(5).all()
+            recent["reminders"] = db.query(Reminder).filter_by(status="active").order_by(Reminder.created_at.desc()).limit(5).all()
+            recent["approvals"] = db.query(Commitment).filter_by(status="pending_approval").order_by(Commitment.created_at.desc()).limit(5).all()
+        finally:
+            db.close()
+
+    return templates.TemplateResponse(request, "home.html", {
+        "user": user, "stats": stats, "recent": recent,
+    })
+
+
+@app.get("/dashboard/todos", response_class=HTMLResponse)
+async def dashboard_todos(request: Request, status: str = "pending", source: str = "", keyword: str = ""):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    items = []
+    groups = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            q = db.query(Commitment)
+            if status and status != "all":
+                q = q.filter_by(status=status)
+            if source:
+                q = q.filter(Commitment.source_name.like(f"%{source}%"))
+            if keyword:
+                q = q.filter(or_(Commitment.content.like(f"%{keyword}%"), Commitment.user_name.like(f"%{keyword}%")))
+            items = q.order_by(Commitment.created_at.desc()).limit(200).all()
+            groups = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+
+    return templates.TemplateResponse(request, "todos.html", {
+        "user": user, "items": items, "groups": groups,
+        "status": status, "source": source, "keyword": keyword,
+    })
+
+
+@app.post("/dashboard/todos/{item_id}/complete")
+async def dashboard_todo_complete(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "done"
+                c.completed_by = f"{user.get('user_name', '')}（網頁）"
+                c.completed_at = datetime.now()
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.post("/dashboard/todos/{item_id}/delete")
+async def dashboard_todo_delete(request: Request, item_id: int):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "deleted"
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.post("/dashboard/todos/new")
+async def dashboard_todo_new(request: Request, content: str = Form(...), due_date: str = Form("")):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            due = None
+            if due_date:
+                try:
+                    due = date.fromisoformat(due_date)
+                except ValueError:
+                    pass
+            c = Commitment(
+                source_type="dashboard", source_id="dashboard", source_name="手動新增",
+                user_id=user.get("email", "dashboard"), user_name=user.get("user_name", ""),
+                content=content, due_date=due, status="pending",
+            )
+            db.add(c)
+            db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.get("/dashboard/tracking", response_class=HTMLResponse)
+async def dashboard_tracking(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(Reminder).order_by(Reminder.created_at.desc()).limit(100).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse(request, "tracking.html", {
+        "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/tracking/{item_id}/cancel")
+async def dashboard_tracking_cancel(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    update_reminder_status(item_id, "cancelled")
+    return RedirectResponse(url="/dashboard/tracking", status_code=302)
+
+
+@app.get("/dashboard/approvals", response_class=HTMLResponse)
+async def dashboard_approvals(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    pending = []
+    history = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            pending = db.query(Commitment).filter_by(status="pending_approval").order_by(Commitment.created_at.desc()).all()
+            history = db.query(Commitment).filter(Commitment.status.in_(["rejected", "pending", "done", "deleted"])).filter(Commitment.source_type == "group").order_by(Commitment.created_at.desc()).limit(50).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse(request, "approvals.html", {
+        "user": user, "pending": pending, "history": history,
+    })
+
+
+@app.post("/dashboard/approvals/{item_id}/approve")
+async def dashboard_approve(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c and c.status == "pending_approval":
+                c.status = "pending"
+                db.commit()
+                if c.source_type == "group":
+                    try:
+                        await push_message(c.source_id, "好的，我們會盡快為您處理，謝謝！")
+                    except Exception as e:
+                        logger.warning(f"Approve push failed: {e}")
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/approvals", status_code=302)
+
+
+@app.post("/dashboard/approvals/{item_id}/reject")
+async def dashboard_reject(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "rejected"
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/approvals", status_code=302)
+
+
+@app.get("/dashboard/groups", response_class=HTMLResponse)
+async def dashboard_groups(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse(request, "groups.html", {
+        "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/groups/{alias}/delete")
+async def dashboard_group_delete(request: Request, alias: str):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            g = db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+            if g:
+                db.delete(g)
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/groups", status_code=302)
+
+
+@app.get("/dashboard/staff", response_class=HTMLResponse)
+async def dashboard_staff(request: Request):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(Staff).order_by(Staff.user_name).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse(request, "staff.html", {
+        "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/staff/{sid}/delete")
+async def dashboard_staff_delete(request: Request, sid: int):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            s = db.query(Staff).filter_by(id=sid).first()
+            if s:
+                db.delete(s)
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/staff", status_code=302)
+
+
+@app.get("/dashboard/messages", response_class=HTMLResponse)
+async def dashboard_messages(request: Request, source: str = "", keyword: str = "", days: int = 7):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    groups = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            q = db.query(MessageLog)
+            cutoff = datetime.now() - timedelta(days=days)
+            q = q.filter(MessageLog.created_at >= cutoff)
+            if source:
+                q = q.filter(MessageLog.source_name.like(f"%{source}%"))
+            if keyword:
+                q = q.filter(MessageLog.text.like(f"%{keyword}%"))
+            items = q.order_by(MessageLog.created_at.desc()).limit(500).all()
+            groups = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse(request, "messages.html", {
+        "user": user, "items": items, "groups": groups,
+        "source": source, "keyword": keyword, "days": days,
+    })
+
+
+@app.get("/dashboard/stats", response_class=HTMLResponse)
+async def dashboard_stats(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    charts = {"status_counts": {}, "daily_messages": [], "completion_rate": 0}
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            # Commitment status distribution
+            for s in ["pending", "done", "deleted", "rejected", "pending_approval"]:
+                charts["status_counts"][s] = db.query(Commitment).filter_by(status=s).count()
+
+            # Daily message count (last 7 days)
+            for i in range(6, -1, -1):
+                day = date.today() - timedelta(days=i)
+                day_start = datetime.combine(day, datetime.min.time())
+                day_end = day_start + timedelta(days=1)
+                count = db.query(MessageLog).filter(
+                    MessageLog.created_at >= day_start,
+                    MessageLog.created_at < day_end,
+                ).count()
+                charts["daily_messages"].append({"date": day.isoformat(), "count": count})
+
+            # Completion rate (last 30 days)
+            recent_cutoff = datetime.now() - timedelta(days=30)
+            total = db.query(Commitment).filter(Commitment.created_at >= recent_cutoff).count()
+            done = db.query(Commitment).filter(
+                Commitment.created_at >= recent_cutoff,
+                Commitment.status == "done",
+            ).count()
+            charts["completion_rate"] = round(done / total * 100, 1) if total > 0 else 0
+        finally:
+            db.close()
+
+    return templates.TemplateResponse(request, "stats.html", {
+        "user": user, "charts": charts,
+    })

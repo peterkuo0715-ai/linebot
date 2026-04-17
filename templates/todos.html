@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% set active = 'todos' %}
+{% block content %}
+<div class="flex justify-between items-start mb-6 flex-wrap gap-3">
+    <div>
+        <h1 class="text-3xl font-bold text-slate-800">待辦管理</h1>
+        <p class="text-slate-500 mt-1">共 {{ items|length }} 筆</p>
+    </div>
+    <button onclick="document.getElementById('new-todo').classList.toggle('hidden')"
+        class="btn px-4 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-blue-600 text-white font-medium shadow-lg">
+        + 新增待辦
+    </button>
+</div>
+
+<div id="new-todo" class="glass rounded-2xl p-4 mb-4 hidden">
+    <form method="post" action="/dashboard/todos/new" class="flex gap-2 flex-wrap">
+        <input name="content" required placeholder="待辦內容" class="flex-1 min-w-[200px] px-3 py-2 rounded-lg bg-white/70 border border-white/80 focus:outline-none focus:ring-2 focus:ring-purple-400">
+        <input name="due_date" type="date" class="px-3 py-2 rounded-lg bg-white/70 border border-white/80 focus:outline-none focus:ring-2 focus:ring-purple-400">
+        <button type="submit" class="btn px-4 py-2 rounded-lg bg-purple-600 text-white">送出</button>
+    </form>
+</div>
+
+<div class="glass rounded-2xl p-4 mb-4">
+    <form method="get" class="flex gap-2 flex-wrap items-center">
+        <select name="status" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+            <option value="pending" {% if status == 'pending' %}selected{% endif %}>待辦中</option>
+            <option value="done" {% if status == 'done' %}selected{% endif %}>已完成</option>
+            <option value="pending_approval" {% if status == 'pending_approval' %}selected{% endif %}>待審核</option>
+            <option value="rejected" {% if status == 'rejected' %}selected{% endif %}>已拒絕</option>
+            <option value="deleted" {% if status == 'deleted' %}selected{% endif %}>已刪除</option>
+            <option value="all" {% if status == 'all' %}selected{% endif %}>全部</option>
+        </select>
+        <input name="source" value="{{ source }}" placeholder="群組名稱" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+        <input name="keyword" value="{{ keyword }}" placeholder="搜尋內容/人員" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+        <button type="submit" class="btn px-4 py-1.5 rounded-lg bg-slate-700 text-white text-sm">篩選</button>
+    </form>
+</div>
+
+<div class="space-y-2">
+    {% for item in items %}
+    <div class="glass glass-hover rounded-xl p-4 flex justify-between items-center gap-3 flex-wrap">
+        <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 text-xs text-slate-500 mb-1 flex-wrap">
+                {% if item.source_name %}<span class="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">{{ item.source_name }}</span>{% endif %}
+                {% if item.user_name %}<span>{{ item.user_name }}</span>{% endif %}
+                {% if item.due_date %}<span>📅 {{ item.due_date }}</span>{% endif %}
+                <span class="text-slate-400">{{ item.created_at.strftime('%m/%d %H:%M') if item.created_at else '' }}</span>
+            </div>
+            <div class="text-slate-800">{{ item.content }}</div>
+            <div class="mt-1 flex gap-2 items-center flex-wrap">
+                {% if item.status == 'pending' %}<span class="inline-block px-2 py-0.5 text-xs bg-amber-100 text-amber-800 rounded-full">待辦中</span>
+                {% elif item.status == 'done' %}<span class="inline-block px-2 py-0.5 text-xs bg-green-100 text-green-800 rounded-full">已完成</span>
+                {% elif item.status == 'pending_approval' %}<span class="inline-block px-2 py-0.5 text-xs bg-blue-100 text-blue-800 rounded-full">待審核</span>
+                {% elif item.status == 'rejected' %}<span class="inline-block px-2 py-0.5 text-xs bg-slate-200 text-slate-600 rounded-full">已拒絕</span>
+                {% elif item.status == 'deleted' %}<span class="inline-block px-2 py-0.5 text-xs bg-red-100 text-red-700 rounded-full">已刪除</span>
+                {% endif %}
+                {% if item.status == 'done' and item.completed_by %}
+                <span class="text-xs text-green-700">✓ {{ item.completed_by }}{% if item.completed_at %} · {{ item.completed_at.strftime('%m/%d %H:%M') }}{% endif %}</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="flex gap-2">
+            {% if item.status == 'pending' %}
+            <form method="post" action="/dashboard/todos/{{ item.id }}/complete">
+                <button class="btn px-3 py-1.5 rounded-lg bg-green-500 text-white text-sm">完成</button>
+            </form>
+            {% endif %}
+            {% if user.role == 'admin' and item.status != 'deleted' %}
+            <form method="post" action="/dashboard/todos/{{ item.id }}/delete" onsubmit="return confirm('確定刪除？')">
+                <button class="btn px-3 py-1.5 rounded-lg bg-red-500 text-white text-sm">刪除</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    {% else %}
+    <div class="glass rounded-2xl p-8 text-center text-slate-500">目前沒有符合條件的待辦</div>
+    {% endfor %}
+</div>
+{% endblock %}

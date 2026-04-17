@@ -1,5 +1,9 @@
 fastapi
 uvicorn
-anthropic
 httpx
 python-multipart
+sqlalchemy
+psycopg2-binary
+apscheduler
+jinja2
+itsdangerous
