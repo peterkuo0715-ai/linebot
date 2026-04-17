@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}藍圈科技 Bot 控制台{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        display: ['-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Microsoft JhengHei', 'sans-serif'],
+                    },
+                },
+            },
+        }
+    </script>
+    <style>
+        body {
+            background: linear-gradient(135deg, #fdf4ff 0%, #ede9fe 25%, #dbeafe 50%, #cffafe 75%, #ecfdf5 100%);
+            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft JhengHei', sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+        .glass {
+            background: rgba(255, 255, 255, 0.55);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.7);
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.1);
+        }
+        .glass-hover {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .glass-hover:hover {
+            transform: translateY(-2px) scale(1.01);
+            box-shadow: 0 20px 40px 0 rgba(31, 38, 135, 0.18);
+            background: rgba(255, 255, 255, 0.75);
+        }
+        .nav-item {
+            transition: all 0.2s ease;
+        }
+        .nav-item:hover {
+            background: rgba(99, 102, 241, 0.1);
+        }
+        .nav-item.active {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(59, 130, 246, 0.15));
+            color: #6366f1;
+        }
+        .btn {
+            transition: all 0.15s ease;
+        }
+        .btn:hover {
+            transform: scale(1.03);
+        }
+        .btn:active {
+            transform: scale(0.97);
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .fade-in {
+            animation: fadeIn 0.4s ease-out;
+        }
+    </style>
+</head>
+<body>
+    {% if user %}
+    <nav class="glass sticky top-0 z-50 px-4 sm:px-8 py-3 flex items-center justify-between flex-wrap gap-2">
+        <div class="flex items-center gap-4 flex-wrap">
+            <a href="/dashboard/home" class="text-lg font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent">
+                🔷 藍圈 Bot 控制台
+            </a>
+            <div class="flex gap-1 flex-wrap">
+                <a href="/dashboard/home" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'home' %}active{% endif %}">首頁</a>
+                <a href="/dashboard/todos" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'todos' %}active{% endif %}">待辦</a>
+                <a href="/dashboard/tracking" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'tracking' %}active{% endif %}">追蹤</a>
+                <a href="/dashboard/approvals" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'approvals' %}active{% endif %}">審核</a>
+                <a href="/dashboard/groups" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'groups' %}active{% endif %}">群組</a>
+                {% if user.role == 'admin' %}
+                <a href="/dashboard/staff" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'staff' %}active{% endif %}">員工</a>
+                {% endif %}
+                <a href="/dashboard/messages" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'messages' %}active{% endif %}">訊息</a>
+                <a href="/dashboard/stats" class="nav-item px-3 py-1.5 rounded-lg text-sm text-slate-700 {% if active == 'stats' %}active{% endif %}">統計</a>
+            </div>
+        </div>
+        <div class="flex items-center gap-3">
+            <span class="text-sm text-slate-600 hidden sm:inline">{{ user.user_name }}{% if user.role %} · {{ user.role }}{% endif %}</span>
+            <form action="/dashboard/logout" method="post">
+                <button type="submit" class="btn text-sm text-red-600 px-3 py-1.5 rounded-lg hover:bg-red-50">登出</button>
+            </form>
+        </div>
+    </nav>
+    {% endif %}
+
+    <main class="px-4 sm:px-8 py-6 max-w-7xl mx-auto fade-in">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

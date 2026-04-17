@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set active = 'messages' %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800">訊息日誌</h1>
+    <p class="text-slate-500 mt-1">顯示 {{ items|length }} 筆訊息（近 {{ days }} 天）</p>
+</div>
+
+<div class="glass rounded-2xl p-4 mb-4">
+    <form method="get" class="flex gap-2 flex-wrap items-center">
+        <select name="days" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+            <option value="1" {% if days == 1 %}selected{% endif %}>今日</option>
+            <option value="7" {% if days == 7 %}selected{% endif %}>近 7 天</option>
+            <option value="30" {% if days == 30 %}selected{% endif %}>近 30 天</option>
+            <option value="90" {% if days == 90 %}selected{% endif %}>近 90 天</option>
+        </select>
+        <input name="source" value="{{ source }}" placeholder="群組名稱" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+        <input name="keyword" value="{{ keyword }}" placeholder="搜尋關鍵字" class="px-3 py-1.5 rounded-lg bg-white/70 border border-white/80 text-sm">
+        <button type="submit" class="btn px-4 py-1.5 rounded-lg bg-slate-700 text-white text-sm">篩選</button>
+    </form>
+</div>
+
+<div class="space-y-1">
+    {% for item in items %}
+    <div class="glass rounded-xl p-3 flex gap-3 items-start">
+        <div class="flex-shrink-0 w-20 text-xs text-slate-400">
+            {{ item.created_at.strftime('%m/%d %H:%M') if item.created_at else '' }}
+        </div>
+        <div class="flex-1 min-w-0">
+            <div class="text-xs text-slate-500 mb-0.5 flex gap-2 flex-wrap">
+                {% if item.source_name %}<span class="px-1.5 py-0 bg-blue-100 text-blue-700 rounded">{{ item.source_name }}</span>{% endif %}
+                {% if item.is_staff %}<span class="px-1.5 py-0 bg-purple-100 text-purple-700 rounded">員工</span>{% endif %}
+                {% if item.user_name %}<span>{{ item.user_name }}</span>{% endif %}
+            </div>
+            <div class="text-sm text-slate-800 whitespace-pre-wrap break-words">{{ item.text }}</div>
+        </div>
+    </div>
+    {% else %}
+    <div class="glass rounded-2xl p-8 text-center text-slate-500">沒有符合條件的訊息</div>
+    {% endfor %}
+</div>
+{% endblock %}

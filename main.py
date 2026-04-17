@@ -10,9 +10,13 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, Date, DateTime, func,
+    create_engine, Column, Integer, String, Text, Date, DateTime, Boolean, func, and_, or_,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -146,6 +150,20 @@ class Reminder(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class MessageLog(Base):
+    __tablename__ = "message_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_type = Column(String(10), nullable=False)
+    source_id = Column(String(64), nullable=False)
+    source_name = Column(String(128), nullable=True)
+    user_id = Column(String(64), nullable=False)
+    user_name = Column(String(128), nullable=True)
+    is_staff = Column(Boolean, default=False)
+    is_bot_reply = Column(Boolean, default=False)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
@@ -194,6 +212,9 @@ def migrate_db():
     if "reminders" not in insp.get_table_names():
         Base.metadata.tables["reminders"].create(engine)
         logger.info("Created reminders table")
+    if "message_logs" not in insp.get_table_names():
+        Base.metadata.tables["message_logs"].create(engine)
+        logger.info("Created message_logs table")
 
 
 @asynccontextmanager
@@ -214,6 +235,12 @@ async def lifespan(app: FastAPI):
         id="reminder_check",
         replace_existing=True,
     )
+    scheduler.add_job(
+        monthly_cleanup_job,
+        CronTrigger(day=1, hour=3, minute=0, timezone="Asia/Taipei"),
+        id="monthly_cleanup",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info("Scheduler started")
     yield
@@ -221,6 +248,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Session middleware for dashboard auth
+SESSION_SECRET = os.environ.get("SESSION_SECRET_KEY", "change-me-in-production-" + hashlib.sha256(LINE_CHANNEL_SECRET.encode()).hexdigest()[:16])
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=86400)  # 24h
+
+# Templates & static files
+templates = Jinja2Templates(directory="templates")
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------------------------------------------------------------------------
 # Conversation history (in-memory)
@@ -1120,6 +1156,47 @@ def cmd_delete(item_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def monthly_cleanup_job():
+    """Clean up data older than 90 days on the 1st of each month."""
+    if not SessionLocal:
+        return
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now() - timedelta(days=90)
+
+        # Delete old message logs
+        deleted_msgs = db.query(MessageLog).filter(MessageLog.created_at < cutoff).delete()
+
+        # Delete completed/deleted/rejected commitments older than 90 days
+        deleted_commits = db.query(Commitment).filter(
+            Commitment.created_at < cutoff,
+            Commitment.status.in_(["done", "deleted", "rejected"]),
+        ).delete(synchronize_session=False)
+
+        # Delete completed/expired/cancelled reminders older than 90 days
+        deleted_reminds = db.query(Reminder).filter(
+            Reminder.created_at < cutoff,
+            Reminder.status.in_(["completed", "expired", "cancelled", "confirmed"]),
+        ).delete(synchronize_session=False)
+
+        db.commit()
+        logger.info(f"Monthly cleanup: {deleted_msgs} messages, {deleted_commits} commitments, {deleted_reminds} reminders deleted")
+
+        admin_group = get_setting("admin_group_id")
+        if admin_group:
+            await push_message(
+                admin_group,
+                f"🧹 每月清理完成\n"
+                f"• 訊息日誌：{deleted_msgs}\n"
+                f"• 已完成待辦：{deleted_commits}\n"
+                f"• 已結束追蹤：{deleted_reminds}"
+            )
+    except Exception as e:
+        logger.error(f"Monthly cleanup failed: {e}")
+    finally:
+        db.close()
+
+
 async def reminder_job():
     """Check and send due reminders every hour."""
     if not SessionLocal:
@@ -1251,6 +1328,37 @@ async def callback(request: Request) -> dict:
         user_text = event["message"]["text"].strip()
         reply_token = event["replyToken"]
         is_admin_group = admin_group and source_id == admin_group
+
+        # Log message to DB (non-blocking fail)
+        if SessionLocal:
+            log_db = SessionLocal()
+            try:
+                group_name_for_log = ""
+                if source_type == "group":
+                    try:
+                        group_name_for_log = await get_group_name(source_id)
+                    except Exception:
+                        pass
+                user_name_for_log = ""
+                try:
+                    user_name_for_log = await get_user_name(
+                        user_id, group_id if source_type == "group" else None
+                    )
+                except Exception:
+                    pass
+                log_db.add(MessageLog(
+                    source_type=source_type, source_id=source_id,
+                    source_name=group_name_for_log,
+                    user_id=user_id, user_name=user_name_for_log,
+                    is_staff=is_staff(user_id),
+                    is_bot_reply=False,
+                    text=user_text,
+                ))
+                log_db.commit()
+            except Exception as e:
+                logger.warning(f"Message log failed: {e}")
+            finally:
+                log_db.close()
 
         # State for reschedule flow
         reschedule_state: dict = {}
@@ -2147,3 +2255,448 @@ async def download_pdf(quote_id: str):
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+# ============================================================================
+# Dashboard Routes
+# ============================================================================
+
+
+def dashboard_get_user(request: Request) -> dict | None:
+    """Get logged-in user from session."""
+    user = request.session.get("user")
+    if not user:
+        return None
+    exp = user.get("expires_at", 0)
+    if datetime.now().timestamp() > exp:
+        request.session.clear()
+        return None
+    return user
+
+
+def require_dashboard_auth(request: Request) -> dict:
+    """Raise redirect if not logged in."""
+    user = dashboard_get_user(request)
+    if not user:
+        raise HTTPException(status_code=302, headers={"Location": "/dashboard/login"})
+    return user
+
+
+def require_dashboard_admin(request: Request) -> dict:
+    user = require_dashboard_auth(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    return user
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_root(request: Request):
+    user = dashboard_get_user(request)
+    if user:
+        return RedirectResponse(url="/dashboard/home", status_code=302)
+    return RedirectResponse(url="/dashboard/login", status_code=302)
+
+
+@app.get("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+
+
+@app.post("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login(request: Request, username: str = Form(...), pin: str = Form(...)):
+    result = erp_verify_staff(username, pin)
+    if not result or not result.get("verified"):
+        err = result.get("error", "驗證失敗") if result else "無法連接 ERP"
+        return templates.TemplateResponse("login.html", {"request": request, "error": err})
+
+    # Store session
+    request.session["user"] = {
+        "user_name": result.get("name", ""),
+        "email": result.get("email", ""),
+        "role": result.get("role", ""),
+        "expires_at": (datetime.now() + timedelta(hours=24)).timestamp(),
+    }
+    return RedirectResponse(url="/dashboard/home", status_code=302)
+
+
+@app.post("/dashboard/logout")
+async def dashboard_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/dashboard/login", status_code=302)
+
+
+@app.get("/dashboard/home", response_class=HTMLResponse)
+async def dashboard_home(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    stats = {
+        "pending_todos": 0, "tracking_active": 0,
+        "pending_approvals": 0, "today_messages": 0,
+    }
+    recent = {"todos": [], "reminders": [], "approvals": []}
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            stats["pending_todos"] = db.query(Commitment).filter_by(status="pending").count()
+            stats["tracking_active"] = db.query(Reminder).filter_by(status="active").count()
+            stats["pending_approvals"] = db.query(Commitment).filter_by(status="pending_approval").count()
+            stats["today_messages"] = db.query(MessageLog).filter(MessageLog.created_at >= today_start).count()
+            recent["todos"] = db.query(Commitment).filter_by(status="pending").order_by(Commitment.created_at.desc()).limit(5).all()
+            recent["reminders"] = db.query(Reminder).filter_by(status="active").order_by(Reminder.created_at.desc()).limit(5).all()
+            recent["approvals"] = db.query(Commitment).filter_by(status="pending_approval").order_by(Commitment.created_at.desc()).limit(5).all()
+        finally:
+            db.close()
+
+    return templates.TemplateResponse("home.html", {
+        "request": request, "user": user, "stats": stats, "recent": recent,
+    })
+
+
+@app.get("/dashboard/todos", response_class=HTMLResponse)
+async def dashboard_todos(request: Request, status: str = "pending", source: str = "", keyword: str = ""):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    items = []
+    groups = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            q = db.query(Commitment)
+            if status and status != "all":
+                q = q.filter_by(status=status)
+            if source:
+                q = q.filter(Commitment.source_name.like(f"%{source}%"))
+            if keyword:
+                q = q.filter(or_(Commitment.content.like(f"%{keyword}%"), Commitment.user_name.like(f"%{keyword}%")))
+            items = q.order_by(Commitment.created_at.desc()).limit(200).all()
+            groups = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+
+    return templates.TemplateResponse("todos.html", {
+        "request": request, "user": user, "items": items, "groups": groups,
+        "status": status, "source": source, "keyword": keyword,
+    })
+
+
+@app.post("/dashboard/todos/{item_id}/complete")
+async def dashboard_todo_complete(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "done"
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.post("/dashboard/todos/{item_id}/delete")
+async def dashboard_todo_delete(request: Request, item_id: int):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "deleted"
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.post("/dashboard/todos/new")
+async def dashboard_todo_new(request: Request, content: str = Form(...), due_date: str = Form("")):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            due = None
+            if due_date:
+                try:
+                    due = date.fromisoformat(due_date)
+                except ValueError:
+                    pass
+            c = Commitment(
+                source_type="dashboard", source_id="dashboard", source_name="手動新增",
+                user_id=user.get("email", "dashboard"), user_name=user.get("user_name", ""),
+                content=content, due_date=due, status="pending",
+            )
+            db.add(c)
+            db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/todos", status_code=302)
+
+
+@app.get("/dashboard/tracking", response_class=HTMLResponse)
+async def dashboard_tracking(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(Reminder).order_by(Reminder.created_at.desc()).limit(100).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse("tracking.html", {
+        "request": request, "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/tracking/{item_id}/cancel")
+async def dashboard_tracking_cancel(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    update_reminder_status(item_id, "cancelled")
+    return RedirectResponse(url="/dashboard/tracking", status_code=302)
+
+
+@app.get("/dashboard/approvals", response_class=HTMLResponse)
+async def dashboard_approvals(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    pending = []
+    history = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            pending = db.query(Commitment).filter_by(status="pending_approval").order_by(Commitment.created_at.desc()).all()
+            history = db.query(Commitment).filter(Commitment.status.in_(["rejected", "pending", "done", "deleted"])).filter(Commitment.source_type == "group").order_by(Commitment.created_at.desc()).limit(50).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse("approvals.html", {
+        "request": request, "user": user, "pending": pending, "history": history,
+    })
+
+
+@app.post("/dashboard/approvals/{item_id}/approve")
+async def dashboard_approve(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c and c.status == "pending_approval":
+                c.status = "pending"
+                db.commit()
+                if c.source_type == "group":
+                    try:
+                        await push_message(c.source_id, "好的，我們會盡快為您處理，謝謝！")
+                    except Exception as e:
+                        logger.warning(f"Approve push failed: {e}")
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/approvals", status_code=302)
+
+
+@app.post("/dashboard/approvals/{item_id}/reject")
+async def dashboard_reject(request: Request, item_id: int):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/dashboard/login", status_code=302)
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            c = db.query(Commitment).filter_by(id=item_id).first()
+            if c:
+                c.status = "rejected"
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/approvals", status_code=302)
+
+
+@app.get("/dashboard/groups", response_class=HTMLResponse)
+async def dashboard_groups(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse("groups.html", {
+        "request": request, "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/groups/{alias}/delete")
+async def dashboard_group_delete(request: Request, alias: str):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            g = db.query(GroupAlias).filter_by(alias=alias.upper()).first()
+            if g:
+                db.delete(g)
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/groups", status_code=302)
+
+
+@app.get("/dashboard/staff", response_class=HTMLResponse)
+async def dashboard_staff(request: Request):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            items = db.query(Staff).order_by(Staff.user_name).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse("staff.html", {
+        "request": request, "user": user, "items": items,
+    })
+
+
+@app.post("/dashboard/staff/{sid}/delete")
+async def dashboard_staff_delete(request: Request, sid: int):
+    try:
+        user = require_dashboard_admin(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            s = db.query(Staff).filter_by(id=sid).first()
+            if s:
+                db.delete(s)
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url="/dashboard/staff", status_code=302)
+
+
+@app.get("/dashboard/messages", response_class=HTMLResponse)
+async def dashboard_messages(request: Request, source: str = "", keyword: str = "", days: int = 7):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+    items = []
+    groups = []
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            q = db.query(MessageLog)
+            cutoff = datetime.now() - timedelta(days=days)
+            q = q.filter(MessageLog.created_at >= cutoff)
+            if source:
+                q = q.filter(MessageLog.source_name.like(f"%{source}%"))
+            if keyword:
+                q = q.filter(MessageLog.text.like(f"%{keyword}%"))
+            items = q.order_by(MessageLog.created_at.desc()).limit(500).all()
+            groups = db.query(GroupAlias).order_by(GroupAlias.alias).all()
+        finally:
+            db.close()
+    return templates.TemplateResponse("messages.html", {
+        "request": request, "user": user, "items": items, "groups": groups,
+        "source": source, "keyword": keyword, "days": days,
+    })
+
+
+@app.get("/dashboard/stats", response_class=HTMLResponse)
+async def dashboard_stats(request: Request):
+    try:
+        user = require_dashboard_auth(request)
+    except HTTPException as e:
+        if e.status_code == 302:
+            return RedirectResponse(url="/dashboard/login", status_code=302)
+        raise
+
+    charts = {"status_counts": {}, "daily_messages": [], "completion_rate": 0}
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            # Commitment status distribution
+            for s in ["pending", "done", "deleted", "rejected", "pending_approval"]:
+                charts["status_counts"][s] = db.query(Commitment).filter_by(status=s).count()
+
+            # Daily message count (last 7 days)
+            for i in range(6, -1, -1):
+                day = date.today() - timedelta(days=i)
+                day_start = datetime.combine(day, datetime.min.time())
+                day_end = day_start + timedelta(days=1)
+                count = db.query(MessageLog).filter(
+                    MessageLog.created_at >= day_start,
+                    MessageLog.created_at < day_end,
+                ).count()
+                charts["daily_messages"].append({"date": day.isoformat(), "count": count})
+
+            # Completion rate (last 30 days)
+            recent_cutoff = datetime.now() - timedelta(days=30)
+            total = db.query(Commitment).filter(Commitment.created_at >= recent_cutoff).count()
+            done = db.query(Commitment).filter(
+                Commitment.created_at >= recent_cutoff,
+                Commitment.status == "done",
+            ).count()
+            charts["completion_rate"] = round(done / total * 100, 1) if total > 0 else 0
+        finally:
+            db.close()
+
+    return templates.TemplateResponse("stats.html", {
+        "request": request, "user": user, "charts": charts,
+    })

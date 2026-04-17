@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% set active = 'staff' %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800">員工管理</h1>
+    <p class="text-slate-500 mt-1">共 {{ items|length }} 位已註冊員工</p>
+</div>
+
+<div class="glass rounded-2xl overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-white/50 text-slate-600 text-xs uppercase tracking-wide">
+            <tr>
+                <th class="px-4 py-3 text-left">姓名</th>
+                <th class="px-4 py-3 text-left">Email</th>
+                <th class="px-4 py-3 text-left">角色</th>
+                <th class="px-4 py-3 text-right">操作</th>
+            </tr>
+        </thead>
+        <tbody class="divide-y divide-white/30">
+            {% for item in items %}
+            <tr class="hover:bg-white/40 transition">
+                <td class="px-4 py-3 text-slate-800">{{ item.user_name or '未命名' }}</td>
+                <td class="px-4 py-3 text-slate-600">{{ item.email or '-' }}</td>
+                <td class="px-4 py-3">
+                    {% if item.role == 'admin' %}
+                    <span class="px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full text-xs">管理員</span>
+                    {% else %}
+                    <span class="px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full text-xs">{{ item.role or '員工' }}</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-3 text-right">
+                    <form method="post" action="/dashboard/staff/{{ item.id }}/delete" onsubmit="return confirm('確定刪除 {{ item.user_name }}？')" class="inline">
+                        <button class="btn text-xs px-2 py-1 rounded-lg bg-red-500 text-white">刪除</button>
+                    </form>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="px-4 py-8 text-center text-slate-500">尚未有員工註冊</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="mt-4 glass rounded-xl p-4 text-sm text-slate-600">
+    <div class="font-medium text-slate-700 mb-1">如何新增員工？</div>
+    <div>員工私訊 LINE Bot 傳送「註冊員工」，依指示輸入 ERP 帳號與 PIN 碼即可自動註冊。</div>
+</div>
+{% endblock %}

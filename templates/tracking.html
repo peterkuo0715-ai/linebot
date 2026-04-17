@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% set active = 'tracking' %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800">追蹤管理</h1>
+    <p class="text-slate-500 mt-1">共 {{ items|length }} 筆</p>
+</div>
+
+<div class="space-y-2">
+    {% for item in items %}
+    <div class="glass glass-hover rounded-xl p-4 flex justify-between items-center gap-3 flex-wrap">
+        <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 text-xs text-slate-500 mb-1 flex-wrap">
+                <span class="font-mono text-purple-600">#{{ item.id }}</span>
+                {% if item.target_alias %}<span class="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">{{ item.target_alias }}</span>{% endif %}
+                {% if item.scheduled_date %}<span>📅 {{ item.scheduled_date }}</span>{% endif %}
+                {% if item.interval_hours %}<span>🔁 每 {{ item.interval_hours }}h 催 {{ item.max_count }} 次（已 {{ item.sent_count }}）</span>{% endif %}
+            </div>
+            <div class="text-slate-800">{{ item.content }}</div>
+            <div class="mt-1">
+                {% if item.status == 'active' %}<span class="inline-block px-2 py-0.5 text-xs bg-blue-100 text-blue-800 rounded-full">進行中</span>
+                {% elif item.status == 'confirmed' %}<span class="inline-block px-2 py-0.5 text-xs bg-purple-100 text-purple-800 rounded-full">已確認</span>
+                {% elif item.status == 'completed' %}<span class="inline-block px-2 py-0.5 text-xs bg-green-100 text-green-800 rounded-full">已完成</span>
+                {% elif item.status == 'expired' %}<span class="inline-block px-2 py-0.5 text-xs bg-orange-100 text-orange-800 rounded-full">已過期</span>
+                {% elif item.status == 'cancelled' %}<span class="inline-block px-2 py-0.5 text-xs bg-slate-200 text-slate-600 rounded-full">已取消</span>
+                {% endif %}
+                {% if item.reply_type %}<span class="ml-1 text-xs text-slate-500">({{ item.reply_type }})</span>{% endif %}
+            </div>
+        </div>
+        {% if item.status == 'active' %}
+        <form method="post" action="/dashboard/tracking/{{ item.id }}/cancel">
+            <button class="btn px-3 py-1.5 rounded-lg bg-red-500 text-white text-sm">取消</button>
+        </form>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="glass rounded-2xl p-8 text-center text-slate-500">目前沒有追蹤</div>
+    {% endfor %}
+</div>
+{% endblock %}

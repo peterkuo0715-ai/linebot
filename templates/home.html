@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% set active = 'home' %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800">首頁</h1>
+    <p class="text-slate-500 mt-1">歡迎回來，{{ user.user_name }}</p>
+</div>
+
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+    <a href="/dashboard/todos?status=pending" class="glass glass-hover rounded-2xl p-5 block">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">待辦中</div>
+        <div class="text-3xl font-bold mt-2 bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">{{ stats.pending_todos }}</div>
+    </a>
+    <a href="/dashboard/tracking" class="glass glass-hover rounded-2xl p-5 block">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">進行中追蹤</div>
+        <div class="text-3xl font-bold mt-2 bg-gradient-to-r from-blue-600 to-cyan-600 bg-clip-text text-transparent">{{ stats.tracking_active }}</div>
+    </a>
+    <a href="/dashboard/approvals" class="glass glass-hover rounded-2xl p-5 block">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">待審核</div>
+        <div class="text-3xl font-bold mt-2 bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ stats.pending_approvals }}</div>
+    </a>
+    <a href="/dashboard/messages" class="glass glass-hover rounded-2xl p-5 block">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">今日訊息</div>
+        <div class="text-3xl font-bold mt-2 bg-gradient-to-r from-green-600 to-emerald-600 bg-clip-text text-transparent">{{ stats.today_messages }}</div>
+    </a>
+</div>
+
+<div class="grid md:grid-cols-3 gap-4">
+    <div class="glass rounded-2xl p-5">
+        <h3 class="font-semibold text-slate-800 mb-3">最近待辦</h3>
+        <div class="space-y-2">
+            {% for t in recent.todos %}
+            <div class="p-2.5 rounded-lg bg-white/50 text-sm">
+                <div class="text-slate-700">{{ t.content[:30] }}{% if t.content|length > 30 %}...{% endif %}</div>
+                <div class="text-xs text-slate-400 mt-0.5">{{ t.source_name or '' }} · {{ t.user_name or '' }}</div>
+            </div>
+            {% else %}
+            <div class="text-sm text-slate-400">目前沒有待辦</div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="glass rounded-2xl p-5">
+        <h3 class="font-semibold text-slate-800 mb-3">進行中追蹤</h3>
+        <div class="space-y-2">
+            {% for r in recent.reminders %}
+            <div class="p-2.5 rounded-lg bg-white/50 text-sm">
+                <div class="text-slate-700">{{ r.content[:30] }}{% if r.content|length > 30 %}...{% endif %}</div>
+                <div class="text-xs text-slate-400 mt-0.5">{{ r.target_alias or '' }} · {% if r.scheduled_date %}{{ r.scheduled_date }}{% else %}週期{% endif %}</div>
+            </div>
+            {% else %}
+            <div class="text-sm text-slate-400">目前沒有追蹤</div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="glass rounded-2xl p-5">
+        <h3 class="font-semibold text-slate-800 mb-3">待審核</h3>
+        <div class="space-y-2">
+            {% for a in recent.approvals %}
+            <div class="p-2.5 rounded-lg bg-white/50 text-sm">
+                <div class="text-slate-700">{{ a.content[:30] }}{% if a.content|length > 30 %}...{% endif %}</div>
+                <div class="text-xs text-slate-400 mt-0.5">{{ a.source_name or '' }} · {{ a.user_name or '' }}</div>
+            </div>
+            {% else %}
+            <div class="text-sm text-slate-400">目前沒有待審核</div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}
