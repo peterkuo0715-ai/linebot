@@ -2301,38 +2301,9 @@ async def dashboard_root(request: Request):
     return RedirectResponse(url="/dashboard/login", status_code=302)
 
 
-@app.get("/dashboard/debug", response_class=HTMLResponse)
-async def dashboard_debug(request: Request):
-    import traceback
-    info = {
-        "templates_dir": TEMPLATES_DIR,
-        "templates_exists": os.path.exists(TEMPLATES_DIR),
-        "static_dir": STATIC_DIR,
-        "static_exists": os.path.exists(STATIC_DIR),
-        "template_files": os.listdir(TEMPLATES_DIR) if os.path.exists(TEMPLATES_DIR) else [],
-        "cwd": os.getcwd(),
-    }
-    try:
-        resp = templates.TemplateResponse("login.html", {"request": request, "error": None})
-        info["template_render"] = "OK"
-        return Response(content=f"<pre>{info}</pre>", media_type="text/html")
-    except Exception as e:
-        info["template_render"] = f"FAILED: {type(e).__name__}: {e}"
-        info["traceback"] = traceback.format_exc()
-        return Response(content=f"<pre>{info}</pre>", media_type="text/html", status_code=500)
-
-
 @app.get("/dashboard/login", response_class=HTMLResponse)
 async def dashboard_login_page(request: Request):
-    try:
-        return templates.TemplateResponse("login.html", {"request": request, "error": None})
-    except Exception as e:
-        import traceback
-        return Response(
-            content=f"<pre>Error: {type(e).__name__}: {e}\n\n{traceback.format_exc()}</pre>",
-            media_type="text/html",
-            status_code=500,
-        )
+    return templates.TemplateResponse(request, "login.html", {"error": None})
 
 
 @app.post("/dashboard/login", response_class=HTMLResponse)
@@ -2340,7 +2311,7 @@ async def dashboard_login(request: Request, username: str = Form(...), pin: str 
     result = erp_verify_staff(username, pin)
     if not result or not result.get("verified"):
         err = result.get("error", "驗證失敗") if result else "無法連接 ERP"
-        return templates.TemplateResponse("login.html", {"request": request, "error": err})
+        return templates.TemplateResponse(request, "login.html", {"error": err})
 
     # Store session
     request.session["user"] = {
@@ -2386,8 +2357,8 @@ async def dashboard_home(request: Request):
         finally:
             db.close()
 
-    return templates.TemplateResponse("home.html", {
-        "request": request, "user": user, "stats": stats, "recent": recent,
+    return templates.TemplateResponse(request, "home.html", {
+        "user": user, "stats": stats, "recent": recent,
     })
 
 
@@ -2417,8 +2388,8 @@ async def dashboard_todos(request: Request, status: str = "pending", source: str
         finally:
             db.close()
 
-    return templates.TemplateResponse("todos.html", {
-        "request": request, "user": user, "items": items, "groups": groups,
+    return templates.TemplateResponse(request, "todos.html", {
+        "user": user, "items": items, "groups": groups,
         "status": status, "source": source, "keyword": keyword,
     })
 
@@ -2503,8 +2474,8 @@ async def dashboard_tracking(request: Request):
             items = db.query(Reminder).order_by(Reminder.created_at.desc()).limit(100).all()
         finally:
             db.close()
-    return templates.TemplateResponse("tracking.html", {
-        "request": request, "user": user, "items": items,
+    return templates.TemplateResponse(request, "tracking.html", {
+        "user": user, "items": items,
     })
 
 
@@ -2535,8 +2506,8 @@ async def dashboard_approvals(request: Request):
             history = db.query(Commitment).filter(Commitment.status.in_(["rejected", "pending", "done", "deleted"])).filter(Commitment.source_type == "group").order_by(Commitment.created_at.desc()).limit(50).all()
         finally:
             db.close()
-    return templates.TemplateResponse("approvals.html", {
-        "request": request, "user": user, "pending": pending, "history": history,
+    return templates.TemplateResponse(request, "approvals.html", {
+        "user": user, "pending": pending, "history": history,
     })
 
 
@@ -2596,8 +2567,8 @@ async def dashboard_groups(request: Request):
             items = db.query(GroupAlias).order_by(GroupAlias.alias).all()
         finally:
             db.close()
-    return templates.TemplateResponse("groups.html", {
-        "request": request, "user": user, "items": items,
+    return templates.TemplateResponse(request, "groups.html", {
+        "user": user, "items": items,
     })
 
 
@@ -2636,8 +2607,8 @@ async def dashboard_staff(request: Request):
             items = db.query(Staff).order_by(Staff.user_name).all()
         finally:
             db.close()
-    return templates.TemplateResponse("staff.html", {
-        "request": request, "user": user, "items": items,
+    return templates.TemplateResponse(request, "staff.html", {
+        "user": user, "items": items,
     })
 
 
@@ -2685,8 +2656,8 @@ async def dashboard_messages(request: Request, source: str = "", keyword: str = 
             groups = db.query(GroupAlias).order_by(GroupAlias.alias).all()
         finally:
             db.close()
-    return templates.TemplateResponse("messages.html", {
-        "request": request, "user": user, "items": items, "groups": groups,
+    return templates.TemplateResponse(request, "messages.html", {
+        "user": user, "items": items, "groups": groups,
         "source": source, "keyword": keyword, "days": days,
     })
 
@@ -2730,6 +2701,6 @@ async def dashboard_stats(request: Request):
         finally:
             db.close()
 
-    return templates.TemplateResponse("stats.html", {
-        "request": request, "user": user, "charts": charts,
+    return templates.TemplateResponse(request, "stats.html", {
+        "user": user, "charts": charts,
     })
