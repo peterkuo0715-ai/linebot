@@ -47,12 +47,15 @@
                 <span class="text-slate-400">{{ item.created_at.strftime('%m/%d %H:%M') if item.created_at else '' }}</span>
             </div>
             <div class="text-slate-800">{{ item.content }}</div>
-            <div class="mt-1">
+            <div class="mt-1 flex gap-2 items-center flex-wrap">
                 {% if item.status == 'pending' %}<span class="inline-block px-2 py-0.5 text-xs bg-amber-100 text-amber-800 rounded-full">待辦中</span>
                 {% elif item.status == 'done' %}<span class="inline-block px-2 py-0.5 text-xs bg-green-100 text-green-800 rounded-full">已完成</span>
                 {% elif item.status == 'pending_approval' %}<span class="inline-block px-2 py-0.5 text-xs bg-blue-100 text-blue-800 rounded-full">待審核</span>
                 {% elif item.status == 'rejected' %}<span class="inline-block px-2 py-0.5 text-xs bg-slate-200 text-slate-600 rounded-full">已拒絕</span>
                 {% elif item.status == 'deleted' %}<span class="inline-block px-2 py-0.5 text-xs bg-red-100 text-red-700 rounded-full">已刪除</span>
+                {% endif %}
+                {% if item.status == 'done' and item.completed_by %}
+                <span class="text-xs text-green-700">✓ {{ item.completed_by }}{% if item.completed_at %} · {{ item.completed_at.strftime('%m/%d %H:%M') }}{% endif %}</span>
                 {% endif %}
             </div>
         </div>

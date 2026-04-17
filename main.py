@@ -113,6 +113,8 @@ class Commitment(Base):
     content = Column(Text, nullable=False)
     due_date = Column(Date, nullable=True)
     status = Column(String(16), default="pending")
+    completed_by = Column(String(128), nullable=True)
+    completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
 
@@ -189,13 +191,17 @@ def migrate_db():
     insp = inspect(engine)
     if "commitments" in insp.get_table_names():
         cols = [c["name"] for c in insp.get_columns("commitments")]
-        if "source_name" not in cols:
-            with engine.connect() as conn:
-                conn.execute(text(
-                    "ALTER TABLE commitments ADD COLUMN source_name VARCHAR(128)"
-                ))
-                conn.commit()
+        with engine.connect() as conn:
+            if "source_name" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN source_name VARCHAR(128)"))
                 logger.info("Added source_name column to commitments")
+            if "completed_by" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN completed_by VARCHAR(128)"))
+                logger.info("Added completed_by column to commitments")
+            if "completed_at" not in cols:
+                conn.execute(text("ALTER TABLE commitments ADD COLUMN completed_at TIMESTAMP"))
+                logger.info("Added completed_at column to commitments")
+            conn.commit()
     if "settings" not in insp.get_table_names():
         Base.metadata.tables["settings"].create(engine)
         logger.info("Created settings table")
@@ -1119,7 +1125,7 @@ def cmd_weekly_report(source_id: str) -> str:
         db.close()
 
 
-def cmd_complete(item_id: int, use_display: bool = False) -> str:
+def cmd_complete(item_id: int, use_display: bool = False, completed_by: str = "") -> str:
     if not SessionLocal:
         return "資料庫未連線。"
     # Resolve display number to DB ID
@@ -1134,8 +1140,11 @@ def cmd_complete(item_id: int, use_display: bool = False) -> str:
         if not c:
             return f"找不到待辦事項，或該事項已完成/刪除。"
         c.status = "done"
+        c.completed_by = completed_by or "未知"
+        c.completed_at = datetime.now()
         db.commit()
-        return f"已完成：{c.content} ✓"
+        by = f"（{completed_by}）" if completed_by else ""
+        return f"已完成：{c.content} ✓ {by}"
     finally:
         db.close()
 
@@ -2094,7 +2103,21 @@ async def callback(request: Request) -> dict:
                 num = int(m.group(1))
                 # -N uses display number, 完成 #N uses DB ID
                 is_shortcut = user_text.startswith("-")
-                await reply_message(reply_token, cmd_complete(num, use_display=is_shortcut))
+                # Get completer name from staff DB or LINE profile
+                completer = ""
+                if SessionLocal:
+                    db = SessionLocal()
+                    try:
+                        s = db.query(Staff).filter_by(user_id=user_id).first()
+                        completer = s.user_name if s else ""
+                    finally:
+                        db.close()
+                if not completer:
+                    try:
+                        completer = await get_user_name(user_id, group_id if source_type == "group" else None)
+                    except Exception:
+                        completer = "LINE 使用者"
+                await reply_message(reply_token, cmd_complete(num, use_display=is_shortcut, completed_by=completer))
                 continue
             m = DELETE_RE.match(user_text)
             if m:
@@ -2406,6 +2429,8 @@ async def dashboard_todo_complete(request: Request, item_id: int):
             c = db.query(Commitment).filter_by(id=item_id).first()
             if c:
                 c.status = "done"
+                c.completed_by = f"{user.get('user_name', '')}（網頁）"
+                c.completed_at = datetime.now()
                 db.commit()
         finally:
             db.close()
