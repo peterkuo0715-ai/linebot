@@ -254,9 +254,13 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET_KEY", "change-me-in-production-"
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=86400)  # 24h
 
 # Templates & static files
-templates = Jinja2Templates(directory="templates")
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+logger.info(f"Templates dir: {TEMPLATES_DIR}, exists: {os.path.exists(TEMPLATES_DIR)}")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ---------------------------------------------------------------------------
 # Conversation history (in-memory)
