@@ -2301,9 +2301,38 @@ async def dashboard_root(request: Request):
     return RedirectResponse(url="/dashboard/login", status_code=302)
 
 
+@app.get("/dashboard/debug", response_class=HTMLResponse)
+async def dashboard_debug(request: Request):
+    import traceback
+    info = {
+        "templates_dir": TEMPLATES_DIR,
+        "templates_exists": os.path.exists(TEMPLATES_DIR),
+        "static_dir": STATIC_DIR,
+        "static_exists": os.path.exists(STATIC_DIR),
+        "template_files": os.listdir(TEMPLATES_DIR) if os.path.exists(TEMPLATES_DIR) else [],
+        "cwd": os.getcwd(),
+    }
+    try:
+        resp = templates.TemplateResponse("login.html", {"request": request, "error": None})
+        info["template_render"] = "OK"
+        return Response(content=f"<pre>{info}</pre>", media_type="text/html")
+    except Exception as e:
+        info["template_render"] = f"FAILED: {type(e).__name__}: {e}"
+        info["traceback"] = traceback.format_exc()
+        return Response(content=f"<pre>{info}</pre>", media_type="text/html", status_code=500)
+
+
 @app.get("/dashboard/login", response_class=HTMLResponse)
 async def dashboard_login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    try:
+        return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    except Exception as e:
+        import traceback
+        return Response(
+            content=f"<pre>Error: {type(e).__name__}: {e}\n\n{traceback.format_exc()}</pre>",
+            media_type="text/html",
+            status_code=500,
+        )
 
 
 @app.post("/dashboard/login", response_class=HTMLResponse)
